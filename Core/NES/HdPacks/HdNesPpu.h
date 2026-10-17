@@ -4,6 +4,7 @@
 #include "NES/NesConsole.h"
 #include "NES/BaseMapper.h"
 #include "NES/HdPacks/HdData.h"
+#include "NES/HdPacks/NesHdLayer.h"
 
 struct NesSpriteInfoEx
 {
@@ -14,6 +15,7 @@ struct NesSpriteInfoEx
 	uint8_t OffsetY;
 	uint8_t LowByte;
 	uint8_t HighByte;
+	uint8_t OamIndex;
 };
 
 struct NesTileInfoEx
@@ -31,12 +33,15 @@ class HdNesPpu final : public NesPpu<HdNesPpu>
 	bool _isChrRam = false;
 	bool _forceRemoveSpriteLimit = false;
 	HdPackData* _hdData = nullptr;
+	unique_ptr<NesHdLayer> _hdLayer; //Only to record
+	unique_ptr<NesHdRecorders> _hdRecorders;
 	NesSpriteInfoEx _exSpriteInfo[64] = {};
 	NesTileInfoEx _previousTileEx = {};
 	NesTileInfoEx _currentTileEx = {};
 	NesTileInfoEx _nextTileEx = {};
 
 public:
+	//hdData is null when only the HD layer (a pack of our own, or recording) is using the PPU
 	HdNesPpu(NesConsole* console, HdPackData* hdData);
 	virtual ~HdNesPpu();
 
@@ -55,6 +60,26 @@ public:
 		info.OffsetY = lineOffset;
 		info.LowByte = sprite.LowByte;
 		info.HighByte = sprite.HighByte;
+
+		//The entry in OAM: the one that is the (_spriteCount + 1)th in range of this scanline, as sprite evaluation found it
+		uint8_t height = _control.LargeSprites ? 16 : 8;
+		uint8_t oamIndex = 0;
+		uint8_t found = 0;
+		for(uint8_t i = 0; i < 64; i++) {
+			uint8_t y = _spriteRam[i * 4];
+			uint8_t row = (_scanline >= 0 ? _scanline : 0) - y;
+			if(_scanline >= 0 && _scanline >= y && row < height) {
+				if(found == _spriteCount) {
+					oamIndex = i;
+					break;
+				}
+				found++;
+			}
+		}
+		info.OamIndex = oamIndex;
+		if(_scanline >= 0) {
+			_info->SpriteTile[oamIndex][_control.LargeSprites ? ((tileAddr >> 4) & 1) : 0] = (int32_t)(info.AbsoluteTileAddr / 16);
+		}
 	}
 
 	__forceinline void StoreTileInformation()
@@ -93,6 +118,10 @@ public:
 			}
 
 			HdPpuPixelInfo& tileInfo = _info->ScreenTiles[bufferOffset];
+		if(_cycle == 1) {
+			_info->SpritesRow[_scanline] = _mask.SpritesEnabled;
+			_info->LargeSprites = _control.LargeSprites;
+		}
 
 			tileInfo.Grayscale = _paletteRamMask == 0x30;
 			tileInfo.EmphasisBits = _intensifyColorBits >> 6;
@@ -116,6 +145,7 @@ public:
 					NesSpriteInfoEx& spriteEx = _exSpriteInfo[i];
 					if(shift >= 0 && shift < 8) {
 						tileInfo.Sprite[j].TileIndex = spriteEx.AbsoluteTileAddr / 16;
+						tileInfo.Sprite[j].OamIndex = spriteEx.OamIndex;
 						if(_isChrRam) {
 							_console->GetMapper()->CopyChrTile(spriteEx.AbsoluteTileAddr & 0xFFFFFFF0, tileInfo.Sprite[j].TileData);
 						}

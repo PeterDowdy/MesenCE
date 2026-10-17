@@ -12,8 +12,6 @@ class SnesHdVideoFilter : public SnesDefaultVideoFilter
 private:
 	SnesHdPack* _pack;
 
-	void DrawObjects(SnesHdFrameData* frame, uint32_t* out, OverscanDimensions overscan);
-
 public:
 	SnesHdVideoFilter(Emulator* emu, SnesHdPack* pack);
 

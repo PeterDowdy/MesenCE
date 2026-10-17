@@ -23,6 +23,12 @@
 //palette the art is drawn as it is. A <variant> is art for one exact live palette, used instead of the graded art
 //(a palette swap that has art of its own).
 //
+//NES. A pack for a NES game (Kirby's Adventure) has "<console>nes" before anything else, and the same tags with
+//the NES's formats: "tileData" is the tile's 16 bytes of CHR data (32 hex digits: the low plane's 8 rows, then the high
+//plane's), and the palette is the 3 colors of the palette entries 1 to 3 as NES color numbers (00 to 3F, 2 hex digits
+//each: 6 digits). An <entry>'s signature is a hash of the CHR bytes of its tile (8x8 sprites) or its two tiles (8x16, the
+//even tile first). There is no Mode 7.
+//
 //MODE 7. A tile of Mode 7's plane (64 pixel colors, in row order) is written "m7:" and its 128 hex digits, and it has no
 //palette: <tile>img,m7:<128 digits>,x,y. Its art is drawn where the plane shows that tile, as it is.
 //
@@ -139,6 +145,9 @@ struct SnesHdFrameData
 	vector<SnesHdObjectInstance> Objects;
 	uint16_t SpritePalette[128] = {};
 	uint8_t SpritePriority[4] = {};
+
+	//NES: a sprite is above another by OAM index alone, whatever its priority
+	bool SpritesByIndex = false;
 };
 
 class SnesHdPack
@@ -154,6 +163,7 @@ private:
 
 	unordered_map<uint64_t, TileEntry> _entries;
 	bool _hasMode7Tiles = false;
+	bool _isNes = false;
 
 	struct LoadState
 	{
@@ -167,6 +177,7 @@ private:
 
 	bool LoadDefinition(const string& definitionFile);
 	bool LoadTile(vector<string>& tokens, LoadState& state, bool variant);
+	bool LoadNesTile(vector<string>& tokens, LoadState& state, bool variant);
 	bool LoadObject(vector<string>& tokens, LoadState& state);
 	bool LoadEntry(vector<string>& tokens, LoadState& state);
 	bool FinishObject(LoadState& state);
@@ -177,8 +188,35 @@ public:
 	vector<SnesHdObject> Objects;
 	unordered_map<uint64_t, vector<uint16_t>> ObjectsByAnchor; //Signature of an object's first entry -> objects, the largest first
 
-	//Returns null when there is no pack for this ROM (or it can't be loaded)
-	static unique_ptr<SnesHdPack> Load(const string& romFileName);
+	//Returns null when there is no pack for this ROM (or it can't be loaded, or it's for the other console)
+	static unique_ptr<SnesHdPack> Load(const string& romFileName, bool nes = false);
+
+	bool IsNes() const { return _isNes; }
+
+	//NES: hash of a tile's 16 CHR bytes, of the 3 colors of its palette, and of the signature of an 8x8 or 8x16 sprite's tiles
+	static uint64_t HashNesTile(const uint8_t* chr);
+	static uint64_t HashNesPalette(uint8_t color1, uint8_t color2, uint8_t color3);
+	static string NesTileHex(const uint8_t* chr);
+
+	//Id of the art for this tile (by HashNesTile) with this palette, or 0
+	uint16_t FindNesTile(uint64_t tileHash, uint8_t color1, uint8_t color2, uint8_t color3) const
+	{
+		auto result = _entries.find(tileHash);
+		if(result == _entries.end()) {
+			return 0;
+		}
+
+		const TileEntry& entry = result->second;
+		if(!entry.Variants.empty()) {
+			uint64_t paletteHash = HashNesPalette(color1, color2, color3);
+			for(auto& variant : entry.Variants) {
+				if(variant.first == paletteHash) {
+					return variant.second;
+				}
+			}
+		}
+		return entry.DefaultId;
+	}
 
 	//Hash of a tile's CHR data (4 words per bpp), and of the colors 1 to N of the palette that starts at paletteBase
 	static uint64_t HashTile(const uint16_t* vram, uint16_t wordAddress, uint8_t bpp);
@@ -239,9 +277,10 @@ private:
 	bool _dirty = false;
 
 public:
-	static unique_ptr<SnesHdRecorder> Create();
+	static unique_ptr<SnesHdRecorder> Create(bool nes = false); //NES: MESEN_NES_HD_RECORD, and the tiles are 2bpp with 3 NES colors
 
 	void Record(bool sprite, uint8_t bpp, const uint16_t* vram, uint16_t wordAddress, const uint16_t* cgram, uint16_t paletteBase, uint32_t frame);
+	void RecordNes(bool sprite, const uint8_t* chr, const uint8_t* colors, uint32_t frame, uint32_t pixels); //NES: "pixels" is how many it drew
 	void Flush();
 };
 

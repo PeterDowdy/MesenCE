@@ -9,7 +9,6 @@ class NesConsole;
 class NesDefaultVideoFilter : public BaseVideoFilter
 {
 private:
-	uint32_t _calculatedPalette[512] = {};
 	VideoConfig _videoConfig = {};
 	NesConfig _nesConfig = {};
 	PpuModel _ppuModel = PpuModel::Ppu2C02;
@@ -17,6 +16,8 @@ private:
 	void InitLookupTable();
 
 protected:
+	uint32_t _calculatedPalette[512] = {};
+
 	void DecodePpuBuffer(uint16_t* ppuOutputBuffer, uint32_t* outputBuffer);
 	void OnBeforeApplyFilter() override;
 

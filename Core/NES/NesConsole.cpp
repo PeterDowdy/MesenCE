@@ -16,6 +16,9 @@
 #include "NES/HdPacks/HdPackBuilder.h"
 #include "NES/HdPacks/HdBuilderPpu.h"
 #include "NES/HdPacks/HdVideoFilter.h"
+#include "NES/HdPacks/NesHdLayer.h"
+#include "NES/HdPacks/NesHdVideoFilter.h"
+#include "SNES/HdPacks/SnesHdPack.h"
 #include "NES/NesDefaultVideoFilter.h"
 #include "NES/NesNtscFilter.h"
 #include "NES/BisqwitNtscFilter.h"
@@ -192,7 +195,7 @@ LoadRomResult NesConsole::LoadRom(VirtualFile& romFile)
 			_controlManager.reset(new NesControlManager(this));
 		}
 
-		if(_hdData) {
+		if(UsesHdPpu() && !dynamic_cast<NsfMapper*>(_mapper.get())) {
 			_ppu.reset(new HdNesPpu(this, _hdData.get()));
 		} else if(dynamic_cast<NsfMapper*>(_mapper.get())) {
 			//Disable most of the PPU for NSFs
@@ -232,10 +235,22 @@ LoadRomResult NesConsole::LoadRom(VirtualFile& romFile)
 	return result;
 }
 
+bool NesConsole::UsesHdPpu()
+{
+	return _hdData || _hdLayerPack || NesHdRecorders::Requested();
+}
+
 void NesConsole::LoadHdPack(VirtualFile& romFile)
 {
 	_hdData.reset();
+	_hdLayerPack.reset();
 	if(GetNesConfig().EnableHdPacks) {
+		//A pack for the HD layer (hires.txt with <console>nes) is used instead of a standard Mesen pack
+		_hdLayerPack = SnesHdPack::Load(romFile.GetFileName(), true);
+		if(_hdLayerPack) {
+			return;
+		}
+
 		_hdData.reset(new HdPackData());
 		if(!HdPackLoader::LoadHdNesPack(romFile, *_hdData.get())) {
 			_hdData.reset();
@@ -473,6 +488,8 @@ BaseVideoFilter* NesConsole::GetVideoFilter(bool getDefaultFilter)
 {
 	if(getDefaultFilter || GetRomFormat() == RomFormat::Nsf) {
 		return new NesDefaultVideoFilter(_emu);
+	} else if(_hdLayerPack && !_hdPackBuilder) {
+		return new NesHdVideoFilter(this, _emu, _hdLayerPack.get());
 	} else if(_hdData && !_hdPackBuilder) {
 		return new HdVideoFilter(this, _emu, _hdData.get());
 	} else {
@@ -742,7 +759,7 @@ void NesConsole::StopRecordingHdPack()
 		_emu->Serialize(saveState, false, 0);
 
 		_memoryManager->UnregisterIODevice(_ppu.get());
-		if(_hdData) {
+		if(UsesHdPpu()) {
 			_ppu.reset(new HdNesPpu(this, _hdData.get()));
 		} else {
 			_ppu.reset(new DefaultNesPpu(this));

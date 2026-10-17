@@ -21,6 +21,7 @@ class HdAudioDevice;
 class HdPackBuilder;
 class Epsm;
 struct HdPackData;
+class SnesHdPack;
 struct HdPackBuilderOptions;
 
 enum class DebugEventType;
@@ -46,6 +47,9 @@ private:
 	unique_ptr<NesSoundMixer> _mixer;
 
 	safe_ptr<HdPackData> _hdData;
+	unique_ptr<SnesHdPack> _hdLayerPack; //The HD layer's own pack (hires.txt with <console>nes), see NesHdLayer.h
+
+	bool UsesHdPpu();
 	unique_ptr<HdAudioDevice> _hdAudioDevice;
 	unique_ptr<HdPackBuilder> _hdPackBuilder;
 

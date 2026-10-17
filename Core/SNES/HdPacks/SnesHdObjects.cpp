@@ -101,9 +101,9 @@ void SnesHdObjectMatcher::Match(const SnesHdPack& pack, const vector<SnesHdOamEn
 	}
 }
 
-unique_ptr<SnesHdObjectRecorder> SnesHdObjectRecorder::Create()
+unique_ptr<SnesHdObjectRecorder> SnesHdObjectRecorder::Create(bool nes)
 {
-	const char* folder = std::getenv("MESEN_SNES_HD_OBJECTS");
+	const char* folder = std::getenv(nes ? "MESEN_NES_HD_OBJECTS" : "MESEN_SNES_HD_OBJECTS");
 	if(!folder || !*folder) {
 		return nullptr;
 	}
@@ -148,23 +148,38 @@ namespace
 		uint32_t b = ((bgr555 >> 10) & 0x1F) * 255 / 31;
 		return 0xFF000000 | (r << 16) | (g << 8) | b;
 	}
-
-	string PaletteHex(const uint16_t* cgram, uint8_t palette)
-	{
-		static const char digits[] = "0123456789abcdef";
-		string result;
-		for(int i = 1; i < 16; i++) {
-			uint16_t color = cgram[128 + palette * 16 + i];
-			for(int shift = 12; shift >= 0; shift -= 4) {
-				result += digits[(color >> shift) & 0x0F];
-			}
-		}
-		return result;
-	}
 }
 
 void SnesHdObjectRecorder::Record(uint32_t frame, const vector<SnesHdOamEntry>& entries, const uint16_t* vram, const uint16_t* cgram)
 {
+	SnesHdRecordSource source;
+	source.ColorIndex = [vram](const SnesHdOamEntry& e, int sx, int sy) {
+		int cellX = e.FlipH ? (e.Width / 8 - 1 - sx / 8) : sx / 8;
+		int cellY = e.FlipV ? (e.Height / 8 - 1 - sy / 8) : sy / 8;
+		int px = e.FlipH ? 7 - (sx % 8) : sx % 8;
+		int py = e.FlipV ? 7 - (sy % 8) : sy % 8;
+
+		uint16_t address = e.Cells[cellY * (e.Width / 8) + cellX];
+		uint16_t lowWord = vram[(address + py) & 0x7FFF];
+		uint16_t highWord = vram[(address + 8 + py) & 0x7FFF];
+		int shift = 7 - px;
+		return (uint8_t)(((lowWord >> shift) & 1) | (((lowWord >> (8 + shift)) & 1) << 1) | (((highWord >> shift) & 1) << 2) | (((highWord >> (8 + shift)) & 1) << 3));
+	};
+	source.Argb = [cgram](const SnesHdOamEntry& e, uint8_t color) { return ToArgb(cgram[128 + e.Palette * 16 + color]); };
+	source.Reference = [cgram](const SnesHdOamEntry& e, SnesHdEntrySpec& spec) {
+		spec.HasReference = true;
+		for(int c = 1; c < 16; c++) {
+			spec.Reference[c] = cgram[128 + e.Palette * 16 + c];
+		}
+	};
+	Record(frame, entries, source);
+}
+
+void SnesHdObjectRecorder::Record(uint32_t frame, const vector<SnesHdOamEntry>& entries, const SnesHdRecordSource& source)
+{
+	_colorsPerPalette = source.ColorsPerPalette;
+	_digitsPerColor = source.DigitsPerColor;
+
 	//Group entries that touch on screen. A group that's too big to be one object is split into runs of entries that are
 	//next to each other in OAM
 	auto touches = [](const SnesHdOamEntry& a, const SnesHdOamEntry& b) {
@@ -289,24 +304,12 @@ void SnesHdObjectRecorder::Record(uint32_t frame, const vector<SnesHdOamEntry>& 
 
 				if(!record.Entries[stored].HasReference) {
 					//The palette the art is authored against: the one the entry is first seen with
-					record.Entries[stored].HasReference = true;
-					for(int c = 1; c < 16; c++) {
-						record.Entries[stored].Reference[c] = cgram[128 + e->Palette * 16 + c];
-					}
+					source.Reference(*e, record.Entries[stored]);
 				}
 
 				for(int sy = 0; sy < e->Height; sy++) {
 					for(int sx = 0; sx < e->Width; sx++) {
-						int cellX = e->FlipH ? (e->Width / 8 - 1 - sx / 8) : sx / 8;
-						int cellY = e->FlipV ? (e->Height / 8 - 1 - sy / 8) : sy / 8;
-						int px = e->FlipH ? 7 - (sx % 8) : sx % 8;
-						int py = e->FlipV ? 7 - (sy % 8) : sy % 8;
-
-						uint16_t address = e->Cells[cellY * (e->Width / 8) + cellX];
-						uint16_t lowWord = vram[(address + py) & 0x7FFF];
-						uint16_t highWord = vram[(address + 8 + py) & 0x7FFF];
-						int shift = 7 - px;
-						uint8_t color = ((lowWord >> shift) & 1) | (((lowWord >> (8 + shift)) & 1) << 1) | (((highWord >> shift) & 1) << 2) | (((highWord >> (8 + shift)) & 1) << 3);
+						uint8_t color = source.ColorIndex(*e, sx, sy);
 						if(color == 0) {
 							continue;
 						}
@@ -315,7 +318,7 @@ void SnesHdObjectRecorder::Record(uint32_t frame, const vector<SnesHdOamEntry>& 
 						int by = e->Y - minY + sy;
 						int ix = mirrorX ? width - 1 - bx : bx;
 						int iy = mirrorY ? height - 1 - by : by;
-						image[iy * width + ix] = ToArgb(cgram[128 + e->Palette * 16 + color]);
+						image[iy * width + ix] = source.Argb(*e, color);
 						index[iy * width + ix] = 0xFF000000 | (stored << 16) | (color << 8);
 					}
 				}
@@ -362,8 +365,8 @@ void SnesHdObjectRecorder::Flush()
 		objects << line;
 		for(const SnesHdEntrySpec& spec : record->Entries) {
 			string palette;
-			for(int c = 1; c < 16; c++) {
-				for(int shift = 12; shift >= 0; shift -= 4) {
+			for(int c = 1; c <= _colorsPerPalette; c++) {
+				for(int shift = (_digitsPerColor - 1) * 4; shift >= 0; shift -= 4) {
 					palette += digits[(spec.Reference[c] >> shift) & 0x0F];
 				}
 			}

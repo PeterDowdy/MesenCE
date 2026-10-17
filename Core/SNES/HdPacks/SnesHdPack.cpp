@@ -54,7 +54,36 @@ uint64_t SnesHdPack::HashPalette(const uint16_t* cgram, uint16_t paletteBase, ui
 	return hash;
 }
 
-unique_ptr<SnesHdPack> SnesHdPack::Load(const string& romFileName)
+uint64_t SnesHdPack::HashNesTile(const uint8_t* chr)
+{
+	uint64_t hash = 0x4E45535449313621ULL; //Not the seed of any SNES hash
+	for(int i = 0; i < 16; i++) {
+		hash = (hash ^ chr[i]) * 0x100000001B3ULL;
+	}
+	return hash;
+}
+
+uint64_t SnesHdPack::HashNesPalette(uint8_t color1, uint8_t color2, uint8_t color3)
+{
+	uint64_t hash = 0x4E4553504C543321ULL;
+	hash = (hash ^ (color1 & 0x3F)) * 0x100000001B3ULL;
+	hash = (hash ^ (color2 & 0x3F)) * 0x100000001B3ULL;
+	hash = (hash ^ (color3 & 0x3F)) * 0x100000001B3ULL;
+	return hash;
+}
+
+string SnesHdPack::NesTileHex(const uint8_t* chr)
+{
+	static const char digits[] = "0123456789abcdef";
+	string result;
+	for(int i = 0; i < 16; i++) {
+		result += digits[chr[i] >> 4];
+		result += digits[chr[i] & 0x0F];
+	}
+	return result;
+}
+
+unique_ptr<SnesHdPack> SnesHdPack::Load(const string& romFileName, bool nes)
 {
 	string romName = FolderUtilities::GetFilename(romFileName, false);
 	string definitionFile = FolderUtilities::CombinePath(FolderUtilities::CombinePath(FolderUtilities::GetHdPackFolder(), romName), "hires.txt");
@@ -63,11 +92,11 @@ unique_ptr<SnesHdPack> SnesHdPack::Load(const string& romFileName)
 	}
 
 	unique_ptr<SnesHdPack> pack(new SnesHdPack());
-	if(!pack->LoadDefinition(definitionFile)) {
+	if(!pack->LoadDefinition(definitionFile) || pack->_isNes != nes) {
 		return nullptr;
 	}
 
-	MessageManager::Log("[HDPack] SNES HD pack loaded: " + definitionFile + " (scale " + std::to_string(pack->Scale) + ", " + std::to_string(pack->Tiles.size()) + " tiles, " + std::to_string(pack->Objects.size()) + " objects)");
+	MessageManager::Log(string("[HDPack] ") + (nes ? "NES" : "SNES") + " HD pack loaded: " + definitionFile + " (scale " + std::to_string(pack->Scale) + ", " + std::to_string(pack->Tiles.size()) + " tiles, " + std::to_string(pack->Objects.size()) + " objects)");
 	return pack;
 }
 
@@ -100,7 +129,9 @@ bool SnesHdPack::LoadDefinition(const string& definitionFile)
 			hasObject = false;
 		}
 
-		if(tag == "scale") {
+		if(tag == "console") {
+			_isNes = value == "nes";
+		} else if(tag == "scale") {
 			Scale = (uint32_t)std::stoi(value);
 			if(Scale < 1 || Scale > MaxScale) {
 				MessageManager::Log("[HDPack] Invalid scale: " + value);
@@ -187,8 +218,79 @@ static void DecodeTile(const vector<uint16_t>& words, uint8_t bpp, uint8_t* inde
 	}
 }
 
+//One row of a NES tile: the low plane's byte, the high plane's byte 8 bytes on
+static void DecodeNesTile(const uint8_t* chr, uint8_t* index)
+{
+	for(int y = 0; y < 8; y++) {
+		for(int x = 0; x < 8; x++) {
+			int shift = 7 - x;
+			index[y * 8 + x] = ((chr[y] >> shift) & 1) | (((chr[y + 8] >> shift) & 1) << 1);
+		}
+	}
+}
+
+bool SnesHdPack::LoadNesTile(vector<string>& tokens, LoadState& state, bool variant)
+{
+	bool validCount = variant ? tokens.size() == 5 : (tokens.size() == 4 || tokens.size() == 5);
+	if(!validCount || tokens[1].size() != 32 || (tokens.size() == 5 && tokens[4].size() != 6)) {
+		MessageManager::Log("[HDPack] Invalid NES tile tag (expected imageIndex,tileData(32 hex digits),x,y[,palette(6 hex digits)])");
+		return false;
+	}
+
+	uint32_t imageIndex = (uint32_t)std::stoi(tokens[0]);
+	uint32_t x = (uint32_t)std::stoi(tokens[2]);
+	uint32_t y = (uint32_t)std::stoi(tokens[3]);
+	uint32_t size = 8 * Scale;
+	if(imageIndex >= state.Images.size() || x + size > state.ImageSizes[imageIndex].first || y + size > state.ImageSizes[imageIndex].second || Tiles.size() >= 0xFFFF) {
+		MessageManager::Log("[HDPack] Invalid NES tile: " + tokens[1]);
+		return false;
+	}
+
+	uint8_t chr[16];
+	for(int i = 0; i < 16; i++) {
+		chr[i] = (uint8_t)HexUtilities::FromHex(tokens[1].substr(i * 2, 2));
+	}
+
+	uint8_t colors[3] = {};
+	if(tokens.size() == 5) {
+		for(int i = 0; i < 3; i++) {
+			colors[i] = (uint8_t)(HexUtilities::FromHex(tokens[4].substr(i * 2, 2)) & 0x3F);
+		}
+	}
+
+	SnesHdTile tile;
+	tile.Pixels.resize(size * size);
+	uint32_t imageWidth = state.ImageSizes[imageIndex].first;
+	for(uint32_t row = 0; row < size; row++) {
+		memcpy(tile.Pixels.data() + row * size, state.Images[imageIndex].data() + (y + row) * imageWidth + x, size * sizeof(uint32_t));
+	}
+
+	if(!variant && tokens.size() == 5) {
+		tile.HasReference = true;
+		DecodeNesTile(chr, tile.Index);
+		for(int i = 0; i < 3; i++) {
+			tile.Reference[i + 1] = colors[i]; //NES color numbers
+		}
+	}
+
+	Tiles.push_back(std::move(tile));
+	uint16_t tileId = (uint16_t)Tiles.size();
+
+	TileEntry& entry = _entries[HashNesTile(chr)];
+	if(variant) {
+		entry.Variants.push_back({ HashNesPalette(colors[0], colors[1], colors[2]), tileId });
+	} else {
+		entry.DefaultId = tileId;
+	}
+	return true;
+}
+
 bool SnesHdPack::LoadTile(vector<string>& tokens, LoadState& state, bool variant)
 {
+	if(_isNes) {
+		return LoadNesTile(tokens, state, variant);
+	}
+
 	if(!variant && tokens.size() >= 4 && tokens[1].rfind("m7:", 0) == 0) {
 		//A tile of Mode 7's plane
 		string data = tokens[1].substr(3);
@@ -334,13 +436,24 @@ bool SnesHdPack::LoadEntry(vector<string>& tokens, LoadState& state)
 	entry.FlipV = std::stoi(tokens[5]) != 0;
 	entry.Signature = std::stoull(tokens[6], nullptr, 16);
 	if(tokens.size() == 8) {
-		if(tokens[7].size() != 60) {
-			return false;
-		}
-		entry.HasReference = true;
-		vector<uint16_t> colors = ParseColors(tokens[7]);
-		for(size_t i = 0; i < colors.size(); i++) {
-			entry.Reference[i + 1] = colors[i];
+		if(_isNes) {
+			//3 NES color numbers, 2 hex digits each
+			if(tokens[7].size() != 6) {
+				return false;
+			}
+			entry.HasReference = true;
+			for(int i = 0; i < 3; i++) {
+				entry.Reference[i + 1] = HexUtilities::FromHex(tokens[7].substr(i * 2, 2)) & 0x3F;
+			}
+		} else {
+			if(tokens[7].size() != 60) {
+				return false;
+			}
+			entry.HasReference = true;
+			vector<uint16_t> colors = ParseColors(tokens[7]);
+			for(size_t i = 0; i < colors.size(); i++) {
+				entry.Reference[i + 1] = colors[i];
+			}
 		}
 	}
 
@@ -411,9 +524,9 @@ bool SnesHdPack::FinishObject(LoadState& state)
 	return true;
 }
 
-unique_ptr<SnesHdRecorder> SnesHdRecorder::Create()
+unique_ptr<SnesHdRecorder> SnesHdRecorder::Create(bool nes)
 {
-	const char* path = std::getenv("MESEN_SNES_HD_RECORD");
+	const char* path = std::getenv(nes ? "MESEN_NES_HD_RECORD" : "MESEN_SNES_HD_RECORD");
 	if(!path || !*path) {
 		return nullptr;
 	}
@@ -458,6 +571,27 @@ void SnesHdRecorder::Record(bool sprite, uint8_t bpp, const uint16_t* vram, uint
 	}
 	_index[key] = _rows.size();
 	_rows.push_back({ string(sprite ? "S " : "B ") + std::to_string(bpp) + " " + ToHex(tile, bpp * 4, true) + " " + ToHex(cgram + ((paletteBase + 1) & 0xFF), (1 << bpp) - 1, false), frame, 1 });
+	_dirty = true;
+}
+
+void SnesHdRecorder::RecordNes(bool sprite, const uint8_t* chr, const uint8_t* colors, uint32_t frame, uint32_t pixels)
+{
+	auto key = std::make_pair(SnesHdPack::HashNesTile(chr) ^ (sprite ? 0 : 0x9E3779B97F4A7C15ULL), SnesHdPack::HashNesPalette(colors[0], colors[1], colors[2]));
+	auto known = _index.find(key);
+	if(known != _index.end()) {
+		_rows[known->second].Fetches += pixels;
+		_dirty = true;
+		return;
+	}
+
+	static const char digits[] = "0123456789abcdef";
+	string palette;
+	for(int i = 0; i < 3; i++) {
+		palette += digits[(colors[i] >> 4) & 0x03];
+		palette += digits[colors[i] & 0x0F];
+	}
+	_index[key] = _rows.size();
+	_rows.push_back({ string(sprite ? "S 2 " : "B 2 ") + SnesHdPack::NesTileHex(chr) + " " + palette, frame, pixels });
 	_dirty = true;
 }
 

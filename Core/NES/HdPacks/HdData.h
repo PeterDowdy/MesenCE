@@ -99,6 +99,7 @@ struct HdPpuTileInfo : public HdTileKey
 	uint8_t SpriteColor = 0;
 	uint8_t PpuBackgroundColor = 0;
 	uint8_t PaletteOffset = 0;
+	uint8_t OamIndex = 0; //Sprites: the entry in OAM (for the HD layer's objects)
 };
 
 struct HdPpuPixelInfo
@@ -119,11 +120,22 @@ struct HdScreenInfo
 	unordered_map<uint32_t, uint8_t> WatchedAddressValues;
 	uint32_t FrameNumber = 0;
 
+	//For the HD layer (objects): OAM as it stood at the end of the frame, the CHR tile each OAM entry drew (the absolute tile
+	//number of the even and the odd tile of an 8x16 sprite, -1 when it wasn't drawn), the sprite palettes and the mask
+	uint8_t Oam[256] = {};
+	int32_t SpriteTile[64][2] = {};
+	uint8_t PaletteRam[32] = {};
+	bool LargeSprites = false;
+	bool SpritesEnabled = false; //In any row of the frame
+	bool SpritesRow[240] = {}; //Whether sprites were enabled when the row started
+	bool SpriteLeftMask = false; //Sprites don't show in the leftmost 8 pixels
+
 	HdScreenInfo(const HdScreenInfo& that) = delete;
 
 	HdScreenInfo(bool isChrRamGame)
 	{
 		ScreenTiles = new HdPpuPixelInfo[NesConstants::ScreenPixelCount];
+		memset(SpriteTile, 0xFF, sizeof(SpriteTile));
 
 		for(int i = 0; i < NesConstants::ScreenPixelCount; i++) {
 			ScreenTiles[i].Tile.BackgroundPriority = false;
