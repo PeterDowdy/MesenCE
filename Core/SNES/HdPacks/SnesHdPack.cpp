@@ -608,9 +608,9 @@ void SnesHdRecorder::Flush()
 	_dirty = false;
 }
 
-unique_ptr<SnesHdPlaneRecorder> SnesHdPlaneRecorder::Create()
+unique_ptr<SnesHdPlaneRecorder> SnesHdPlaneRecorder::Create(bool nes)
 {
-	const char* folder = std::getenv("MESEN_SNES_HD_PLANES");
+	const char* folder = std::getenv(nes ? "MESEN_NES_HD_PLANES" : "MESEN_SNES_HD_PLANES");
 	if(!folder || !*folder) {
 		return nullptr;
 	}

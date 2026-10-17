@@ -16,7 +16,7 @@ HdNesPpu::HdNesPpu(NesConsole* console, HdPackData* hdData) : NesPpu(console)
 	_info = _screenInfo[0];
 	if(NesHdRecorders::Requested()) {
 		_hdLayer.reset(new NesHdLayer(_console->GetMapper(), nullptr));
-		_hdRecorders.reset(new NesHdRecorders(_hdLayer.get(), _console->GetNesConfig()));
+		_hdRecorders.reset(new NesHdRecorders(_hdLayer.get(), _console->GetMapper(), _console->GetNesConfig()));
 	}
 	_forceRemoveSpriteLimit = _hdData && (_hdData->OptionFlags & (int)HdPackOptions::NoSpriteLimit) != 0;
 }
@@ -36,6 +36,8 @@ void* HdNesPpu::OnBeforeSendFrame()
 	for(int i = 0; i < 32; i++) {
 		info->PaletteRam[i] = _paletteRam[i];
 	}
+	info->BackgroundEnabled = _mask.BackgroundEnabled;
+	info->BackgroundPattern = _control.BackgroundPatternAddr;
 	info->SpritesEnabled = false;
 	for(int row = 0; row < 240; row++) {
 		info->SpritesEnabled |= info->SpritesRow[row];

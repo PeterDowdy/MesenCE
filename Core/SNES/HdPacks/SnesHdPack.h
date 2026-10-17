@@ -316,7 +316,7 @@ private:
 	bool _dirty = false;
 
 public:
-	static unique_ptr<SnesHdPlaneRecorder> Create();
+	static unique_ptr<SnesHdPlaneRecorder> Create(bool nes = false); //NES: MESEN_NES_HD_PLANES (Core/NES/HdPacks/NesHdLayer.h)
 
 	//Counts a frame the plane was shown. True when its files should be (re)written: it's new, or the palette it is shown
 	//in now has clearly more spread than the one they were drawn in

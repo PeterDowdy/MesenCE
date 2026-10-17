@@ -43,6 +43,28 @@ public:
 	void BuildFrame(HdScreenInfo& info, SnesHdFrameData& frame, vector<uint32_t>& lowRes, const uint32_t* palette);
 };
 
+//The pictures the background shows (MESEN_NES_HD_PLANES=<folder>), as SnesHdPlaneRecorder writes them for the SNES (planes.txt,
+//plane_<key>.png and .json with the cells of the nametables, the 512x480 area or the part of it that isn't a mirror). Cells
+//are [tile slot, 0, 0, palette 0-3] and "palette" is the 32 bytes of palette RAM (2 hex digits each); "bpp" is 2. A state that
+//is shown for fewer than 10 frames in a row (the background streaming in as the screen scrolls) isn't recorded.
+class NesHdPlaneRecorder
+{
+private:
+	unique_ptr<SnesHdPlaneRecorder> _recorder;
+	BaseMapper* _mapper;
+	uint32_t _palette[512] = {};
+	uint64_t _lastKey = 0;
+	uint32_t _stable = 0;
+
+public:
+	static bool Requested();
+
+	NesHdPlaneRecorder(BaseMapper* mapper, NesConfig& config);
+
+	void Record(const HdScreenInfo& info);
+	void Flush();
+};
+
 //MESEN_NES_HD_RECORD=<file> (tiles, as SnesHdRecorder writes them for the SNES) and MESEN_NES_HD_OBJECTS=<folder> (as
 //SnesHdObjectRecorder), taken from the frames the HD PPU records
 class NesHdRecorders
@@ -50,6 +72,7 @@ class NesHdRecorders
 private:
 	unique_ptr<SnesHdRecorder> _tiles;
 	unique_ptr<SnesHdObjectRecorder> _objects;
+	unique_ptr<NesHdPlaneRecorder> _planes;
 	NesHdLayer* _layer = nullptr;
 	uint32_t _palette[512] = {};
 	uint8_t _currentPalette[16] = {}; //The sprite palettes of the frame being recorded
@@ -57,7 +80,7 @@ private:
 public:
 	static bool Requested();
 
-	NesHdRecorders(NesHdLayer* layer, NesConfig& config);
+	NesHdRecorders(NesHdLayer* layer, BaseMapper* mapper, NesConfig& config);
 	~NesHdRecorders();
 
 	void Record(HdScreenInfo& info, const uint16_t* ppuBuffer);

@@ -3,6 +3,8 @@
 #include "NES/BaseMapper.h"
 #include "NES/NesConstants.h"
 #include "NES/NesDefaultVideoFilter.h"
+#include <climits>
+#include <map>
 
 NesHdLayer::NesHdLayer(BaseMapper* mapper, const SnesHdPack* pack)
 {
@@ -240,11 +242,14 @@ bool NesHdRecorders::Requested()
 {
 	const char* tiles = std::getenv("MESEN_NES_HD_RECORD");
 	const char* objects = std::getenv("MESEN_NES_HD_OBJECTS");
-	return (tiles && *tiles) || (objects && *objects);
+	return (tiles && *tiles) || (objects && *objects) || NesHdPlaneRecorder::Requested();
 }
 
-NesHdRecorders::NesHdRecorders(NesHdLayer* layer, NesConfig& config)
+NesHdRecorders::NesHdRecorders(NesHdLayer* layer, BaseMapper* mapper, NesConfig& config)
 {
+	if(NesHdPlaneRecorder::Requested()) {
+		_planes.reset(new NesHdPlaneRecorder(mapper, config));
+	}
 	_layer = layer;
 	NesDefaultVideoFilter::GetFullPalette(_palette, config, PpuModel::Ppu2C02);
 	_tiles = SnesHdRecorder::Create(true);
@@ -264,10 +269,17 @@ void NesHdRecorders::Flush()
 	if(_objects) {
 		_objects->Flush();
 	}
+	if(_planes) {
+		_planes->Flush();
+	}
 }
 
 void NesHdRecorders::Record(HdScreenInfo& info, const uint16_t* ppuBuffer)
 {
+	if(_planes) {
+		_planes->Record(info);
+	}
+
 	if(_tiles) {
 		//Count the pixels of every tile (and palette) that shows: a background tile where no sprite covers it, a sprite where it wins
 		const HdPpuTileInfo* lastTile = nullptr;
@@ -342,4 +354,130 @@ void NesHdRecorders::Record(HdScreenInfo& info, const uint16_t* ppuBuffer)
 		};
 		_objects->Record(info.FrameNumber, entries, source);
 	}
+}
+
+bool NesHdPlaneRecorder::Requested()
+{
+	const char* folder = std::getenv("MESEN_NES_HD_PLANES");
+	return folder && *folder;
+}
+
+NesHdPlaneRecorder::NesHdPlaneRecorder(BaseMapper* mapper, NesConfig& config)
+{
+	_mapper = mapper;
+	_recorder = SnesHdPlaneRecorder::Create(true);
+	NesDefaultVideoFilter::GetFullPalette(_palette, config, PpuModel::Ppu2C02);
+}
+
+void NesHdPlaneRecorder::Flush()
+{
+	_recorder->Flush();
+}
+
+void NesHdPlaneRecorder::Record(const HdScreenInfo& info)
+{
+	if(!info.BackgroundEnabled) {
+		return;
+	}
+
+	uint8_t tables[4][0x400];
+	for(int t = 0; t < 4; t++) {
+		for(int i = 0; i < 0x400; i++) {
+			tables[t][i] = _mapper->DebugReadVram(0x2000 + t * 0x400 + i, true);
+		}
+	}
+	auto same = [&](int a, int b) { return memcmp(tables[a], tables[b], 0x400) == 0; };
+	bool wide = !same(0, 1) || !same(2, 3);
+	bool tall = !same(0, 2) || !same(1, 3);
+	int columns = wide ? 64 : 32;
+	int rows = tall ? 60 : 30;
+
+	//The graphics of every tile the background can use
+	uint8_t chr[256][16];
+	for(int tile = 0; tile < 256; tile++) {
+		for(int i = 0; i < 16; i++) {
+			chr[tile][i] = _mapper->DebugReadVram((info.BackgroundPattern | (tile << 4)) + i, true);
+		}
+	}
+
+	struct Cell { uint8_t Tile; uint8_t Palette; };
+	vector<Cell> cells(columns * rows);
+	uint64_t key = 0x4E45535050414E45ULL;
+	for(int cy = 0; cy < rows; cy++) {
+		for(int cx = 0; cx < columns; cx++) {
+			const uint8_t* table = tables[(cy / 30) * 2 + (cx / 32)];
+			int ry = cy % 30;
+			int rx = cx % 32;
+			uint8_t tile = table[ry * 32 + rx];
+			uint8_t attribute = table[0x3C0 + (ry / 4) * 8 + rx / 4];
+			uint8_t palette = (attribute >> (((ry & 2) ? 4 : 0) + ((rx & 2) ? 2 : 0))) & 3;
+			cells[cy * columns + cx] = { tile, palette };
+			key = (key ^ SnesHdPack::HashNesTile(chr[tile])) * 0x100000001B3ULL;
+			key = (key ^ palette) * 0x100000001B3ULL;
+		}
+	}
+	key = (key ^ columns) * 0x100000001B3ULL;
+	key = (key ^ rows) * 0x100000001B3ULL;
+
+	if(key != _lastKey) {
+		_lastKey = key;
+		_stable = 0;
+		return;
+	}
+	if(++_stable < 10) {
+		return;
+	}
+
+	//The spread of the background palettes' colors: a fade narrows it
+	int lowest = INT_MAX, highest = INT_MIN;
+	for(int i = 0; i < 16; i++) {
+		if(i & 3) {
+			uint32_t color = _palette[info.PaletteRam[i] & 0x3F];
+			int luminance = ((color >> 16) & 0xFF) + ((color >> 8) & 0xFF) + (color & 0xFF);
+			lowest = std::min(lowest, luminance);
+			highest = std::max(highest, luminance);
+		}
+	}
+
+	if(!_recorder->Seen(key, 0, 2, columns * 8, rows * 8, info.FrameNumber, highest - lowest)) {
+		return;
+	}
+
+	int width = columns * 8;
+	int height = rows * 8;
+	vector<uint32_t> pixels(width * height, 0);
+	std::map<string, int> slotOf;
+	string tileList;
+	string grid;
+	for(int cy = 0; cy < rows; cy++) {
+		for(int cx = 0; cx < columns; cx++) {
+			const Cell& cell = cells[cy * columns + cx];
+			for(int y = 0; y < 8; y++) {
+				for(int x = 0; x < 8; x++) {
+					uint8_t color = ((chr[cell.Tile][y] >> (7 - x)) & 1) | (((chr[cell.Tile][y + 8] >> (7 - x)) & 1) << 1);
+					if(color) {
+						pixels[(cy * 8 + y) * width + cx * 8 + x] = _palette[info.PaletteRam[cell.Palette * 4 + color] & 0x3F] | 0xFF000000;
+					}
+				}
+			}
+
+			string hex = SnesHdPack::NesTileHex(chr[cell.Tile]);
+			auto slot = slotOf.find(hex);
+			if(slot == slotOf.end()) {
+				slot = slotOf.insert({ hex, (int)slotOf.size() }).first;
+				tileList += (slot->second ? ",\"" : "\"") + hex + "\"";
+			}
+			grid += string(cy || cx ? "," : "") + "[" + std::to_string(slot->second) + ",0,0," + std::to_string(cell.Palette) + "]";
+		}
+	}
+
+	static const char digits[] = "0123456789abcdef";
+	string palette;
+	for(int i = 0; i < 32; i++) {
+		palette += digits[(info.PaletteRam[i] >> 4) & 3];
+		palette += digits[info.PaletteRam[i] & 0x0F];
+	}
+	string json = "{\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) + ",\"bpp\":2,\"mode7\":false,\"cols\":" +
+		std::to_string(columns) + ",\"rows\":" + std::to_string(rows) + ",\"palette\":\"" + palette + "\",\"tiles\":[" + tileList + "],\"cells\":[" + grid + "]}";
+	_recorder->Write(key, pixels, width, height, json);
 }

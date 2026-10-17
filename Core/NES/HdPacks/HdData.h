@@ -127,6 +127,8 @@ struct HdScreenInfo
 	uint8_t PaletteRam[32] = {};
 	bool LargeSprites = false;
 	bool SpritesEnabled = false; //In any row of the frame
+	bool BackgroundEnabled = false; //At the end of the frame, with the pattern table it uses
+	uint16_t BackgroundPattern = 0;
 	bool SpritesRow[240] = {}; //Whether sprites were enabled when the row started
 	bool SpriteLeftMask = false; //Sprites don't show in the leftmost 8 pixels
 
