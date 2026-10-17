@@ -389,10 +389,13 @@ static string ToHex(const uint16_t* words, size_t count, bool bytes)
 	return result;
 }
 
-void SnesHdRecorder::Record(bool sprite, uint8_t bpp, const uint16_t* vram, uint16_t wordAddress, const uint16_t* cgram, uint16_t paletteBase)
+void SnesHdRecorder::Record(bool sprite, uint8_t bpp, const uint16_t* vram, uint16_t wordAddress, const uint16_t* cgram, uint16_t paletteBase, uint32_t frame)
 {
 	auto key = std::make_pair(SnesHdPack::HashTile(vram, wordAddress, bpp) ^ (sprite ? 0 : 0x9E3779B97F4A7C15ULL), SnesHdPack::HashPalette(cgram, paletteBase, bpp));
-	if(!_seen.insert(key).second) {
+	auto known = _index.find(key);
+	if(known != _index.end()) {
+		_rows[known->second].Fetches++;
+		_dirty = true;
 		return;
 	}
 
@@ -400,7 +403,8 @@ void SnesHdRecorder::Record(bool sprite, uint8_t bpp, const uint16_t* vram, uint
 	for(int i = 0; i < bpp * 4; i++) {
 		tile[i] = vram[(wordAddress + i) & 0x7FFF];
 	}
-	_lines.push_back(string(sprite ? "S " : "B ") + std::to_string(bpp) + " " + ToHex(tile, bpp * 4, true) + " " + ToHex(cgram + ((paletteBase + 1) & 0xFF), (1 << bpp) - 1, false));
+	_index[key] = _rows.size();
+	_rows.push_back({ string(sprite ? "S " : "B ") + std::to_string(bpp) + " " + ToHex(tile, bpp * 4, true) + " " + ToHex(cgram + ((paletteBase + 1) & 0xFF), (1 << bpp) - 1, false), frame, 1 });
 	_dirty = true;
 }
 
@@ -411,8 +415,8 @@ void SnesHdRecorder::Flush()
 	}
 
 	ofstream file(_path, std::ios::out | std::ios::trunc);
-	for(string& line : _lines) {
-		file << line << "\n";
+	for(Row& row : _rows) {
+		file << row.Text << " " << row.FirstFrame << " " << row.Fetches << "\n";
 	}
 	_dirty = false;
 }

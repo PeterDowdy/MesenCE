@@ -1131,7 +1131,7 @@ void SnesPpu::RecordHdBgPixel(int x, uint8_t priority, uint32_t cell)
 uint16_t SnesPpu::LookupHdTile(uint8_t bpp, uint16_t wordAddress, uint16_t paletteBase, bool sprite)
 {
 	if(_hdRecorder) {
-		_hdRecorder->Record(sprite, bpp, _vram, wordAddress, _cgram, paletteBase);
+		_hdRecorder->Record(sprite, bpp, _vram, wordAddress, _cgram, paletteBase, _frameCount);
 	}
 	return _hdPack ? _hdPack->FindTile(_vram, wordAddress, bpp, _cgram, paletteBase) : 0;
 }

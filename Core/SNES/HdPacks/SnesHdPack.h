@@ -1,5 +1,6 @@
 #pragma once
 #include "pch.h"
+#include <map>
 #include <set>
 
 //Prototype HD pack for SNES sprites and backgrounds. See docs/snes-hd.md in pixel-hd-studio for how it fits together.
@@ -204,19 +205,29 @@ public:
 };
 
 //Writes every tile and palette the PPU fetches to a text file, as the tileData and palette fields of a <tile> tag
-//(plus whether it was drawn as a sprite or a background): the tiles a pack needs art for. Enabled by setting the
-//environment variable MESEN_SNES_HD_RECORD to the file's path.
+//(plus whether it was drawn as a sprite or a background): the tiles a pack needs art for. A line is
+//  S|B <bpp> <tileData> <palette> <first frame> <fetches>
+//where the fetches are how many times the PPU fetched that tile in that palette (a tile on screen for a frame is
+//fetched once for each of its 8 rows in every scanline it covers), so tiles drawn for a moment can be told from the
+//ones that stay. Enabled by setting the environment variable MESEN_SNES_HD_RECORD to the file's path.
 class SnesHdRecorder
 {
 private:
+	struct Row
+	{
+		string Text;
+		uint32_t FirstFrame = 0;
+		uint32_t Fetches = 0;
+	};
+
 	string _path;
-	std::set<std::pair<uint64_t, uint64_t>> _seen;
-	vector<string> _lines;
+	std::map<std::pair<uint64_t, uint64_t>, size_t> _index;
+	vector<Row> _rows;
 	bool _dirty = false;
 
 public:
 	static unique_ptr<SnesHdRecorder> Create();
 
-	void Record(bool sprite, uint8_t bpp, const uint16_t* vram, uint16_t wordAddress, const uint16_t* cgram, uint16_t paletteBase);
+	void Record(bool sprite, uint8_t bpp, const uint16_t* vram, uint16_t wordAddress, const uint16_t* cgram, uint16_t paletteBase, uint32_t frame);
 	void Flush();
 };
