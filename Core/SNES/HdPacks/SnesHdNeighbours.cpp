@@ -60,6 +60,9 @@ void SnesHdNeighbourRecorder::Frame(const vector<SnesHdNeighbourTile>& tiles)
 {
 	_frames++;
 	_dirty = true;
+	for(const SnesHdNeighbourTile& tile : tiles) {
+		_drawn.insert(tile.Tile - 1);
+	}
 
 	//Tiles at the same offset from the 8 pixel grid are in one grid
 	std::map<int, vector<const SnesHdNeighbourTile*>> bands;
@@ -121,6 +124,12 @@ void SnesHdNeighbourRecorder::Flush()
 	for(size_t i = 0; i < _tiles.size(); i++) {
 		size_t space = _tiles[i].find(' ');
 		file << (i ? "," : "") << "[" << _tiles[i].substr(0, space) << ",\"" << _tiles[i].substr(space + 1) << "\"]";
+	}
+	file << "],\"drawn\":[";
+	bool first = true;
+	for(uint32_t tile : _drawn) {
+		file << (first ? "" : ",") << tile;
+		first = false;
 	}
 	file << "],\"screens\":[";
 	for(size_t i = 0; i < _screens.size(); i++) {

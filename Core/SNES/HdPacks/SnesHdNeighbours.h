@@ -1,6 +1,7 @@
 #pragma once
 #include "pch.h"
 #include <functional>
+#include <set>
 
 //The screens the background tile graphics are drawn in, as grids of tiles, for restyling a tileset with its neighbours around it
 //(MESEN_SNES_HD_NEIGHBOURS=<file>, MESEN_NES_HD_NEIGHBOURS=<file>). A tile on screen is found from the pixels the PPU drew (the
@@ -10,6 +11,7 @@
 //
 //  {"every": 3, "frames": <counted frames>,
 //   "tiles": [[<bpp>, "<tile data, as the <tile> tag writes it>"], ...],       the tile graphics: the same tile in another palette is one
+//   "drawn": [tile, ...],                                                       every tile that won a main screen pixel in a counted frame
 //   "screens": [{"weight": <counted frames it was shown in>, "cols": c, "rows": r,
 //                "cells": [n, ...]}, ...]}      in reading order, one integer per cell: 0 = no tile drawn there, otherwise
 //                                               (tile + 1) * 4 + flipH * 2 + flipV, where tile is an index into "tiles"
@@ -40,6 +42,7 @@ private:
 	};
 	std::unordered_map<uint64_t, size_t> _screenIndex; //Hash of a grid -> position in _screens
 	vector<Screen> _screens;
+	std::set<uint32_t> _drawn; //The tiles that won a background pixel in a counted frame
 	uint32_t _frames = 0;
 	bool _dirty = false;
 
