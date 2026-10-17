@@ -23,6 +23,9 @@
 //palette the art is drawn as it is. A <variant> is art for one exact live palette, used instead of the graded art
 //(a palette swap that has art of its own).
 //
+//MODE 7. A tile of Mode 7's plane (64 pixel colors, in row order) is written "m7:" and its 128 hex digits, and it has no
+//palette: <tile>img,m7:<128 digits>,x,y. Its art is drawn where the plane shows that tile, as it is.
+//
 //OBJECTS. A game object is a group of OAM entries (a metasprite). The pack lists the entries a object is made of, where
 //they sit in the object's box (relX, relY from its top left corner, in pixels), their size, flips, and "signature": a
 //hash of the CHR data of the entry's tiles that the recorder writes (MESEN_SNES_HD_OBJECTS). When every entry is in
@@ -150,6 +153,7 @@ private:
 	};
 
 	unordered_map<uint64_t, TileEntry> _entries;
+	bool _hasMode7Tiles = false;
 
 	struct LoadState
 	{
@@ -178,6 +182,8 @@ public:
 
 	//Hash of a tile's CHR data (4 words per bpp), and of the colors 1 to N of the palette that starts at paletteBase
 	static uint64_t HashTile(const uint16_t* vram, uint16_t wordAddress, uint8_t bpp);
+	static uint64_t HashMode7Tile(const uint16_t* vram, uint8_t tile); //A tile of Mode 7's plane: the high bytes of its 64 words
+	static string TileHex(const uint16_t* vram, uint16_t wordAddress, uint8_t bpp); //The tile as the <tile> tag writes it
 	static uint64_t HashPalette(const uint16_t* cgram, uint16_t paletteBase, uint8_t bpp);
 
 	//Id of the art for this tile with this palette, or 0
@@ -201,6 +207,13 @@ public:
 	}
 
 	const SnesHdTile& GetTile(uint16_t tileId) const { return Tiles[tileId - 1]; }
+
+	bool HasMode7Tiles() const { return _hasMode7Tiles; }
+	uint16_t FindMode7Tile(const uint16_t* vram, uint8_t tile) const
+	{
+		auto result = _entries.find(HashMode7Tile(vram, tile));
+		return result == _entries.end() ? 0 : result->second.DefaultId;
+	}
 	bool HasObjects() const { return !Objects.empty(); }
 };
 
@@ -229,5 +242,46 @@ public:
 	static unique_ptr<SnesHdRecorder> Create();
 
 	void Record(bool sprite, uint8_t bpp, const uint16_t* vram, uint16_t wordAddress, const uint16_t* cgram, uint16_t paletteBase, uint32_t frame);
+	void Flush();
+};
+
+//Writes the pictures the background layers show while a game is played (MESEN_SNES_HD_PLANES=<folder>), as the
+//authoring unit for backgrounds: a studio restyles a picture as a whole, then cuts the art back into the tiles it is made
+//of (the pack replaces tiles, so this never has to match a picture again at run time, which animation and streaming
+//would break). For each distinct plane, a layer's whole tilemap area (or Mode 7's 1024x1024 plane):
+//  planes.txt         ``P <key> <layer> <bpp> <width> <height> <first frame> <frames shown> <spread>`` per plane
+//  plane_<key>.png    the picture at the original resolution (ARGB, alpha 0 where nothing is drawn), in the palette with
+//                     the most spread between its darkest and brightest colors that it was shown in (a fade narrows it)
+//  plane_<key>.json   its cells: ``{width, height, bpp, mode7, cols, rows, cgram, tiles: [tile data hex],
+//                     cells: [[tile, flipH, flipV, palette base], ...]}``, one cell per 8x8 pixels in reading order. Tile
+//                     data is as the pack's <tile> tag writes it (for Mode 7, the 64 pixel colors). cgram is the 256 colors
+//                     (4 hex digits each) the picture was drawn with
+//The key is a hash of the layer's tilemap and the graphics of the tiles it uses: it names a state of the picture, and a
+//picture whose tiles animate has one plane per state.
+class SnesHdPlaneRecorder
+{
+private:
+	struct Plane
+	{
+		uint8_t Layer = 0;
+		uint8_t Bpp = 0;
+		uint16_t Width = 0;
+		uint16_t Height = 0;
+		uint32_t FirstFrame = 0;
+		uint32_t Frames = 0;
+		int Spread = -1;
+	};
+
+	string _folder;
+	std::map<uint64_t, Plane> _planes;
+	bool _dirty = false;
+
+public:
+	static unique_ptr<SnesHdPlaneRecorder> Create();
+
+	//Counts a frame the plane was shown. True when its files should be (re)written: it's new, or the palette it is shown
+	//in now has clearly more spread than the one they were drawn in
+	bool Seen(uint64_t key, uint8_t layer, uint8_t bpp, uint16_t width, uint16_t height, uint32_t frame, int spread);
+	void Write(uint64_t key, const vector<uint32_t>& pixels, uint16_t width, uint16_t height, const string& cells);
 	void Flush();
 };

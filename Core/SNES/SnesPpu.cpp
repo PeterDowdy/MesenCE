@@ -46,6 +46,7 @@ SnesPpu::SnesPpu(Emulator* emu, SnesConsole* console)
 	}
 	_hdRecorder = SnesHdRecorder::Create();
 	_hdObjectRecorder = SnesHdObjectRecorder::Create();
+	_hdPlaneRecorder = SnesHdPlaneRecorder::Create();
 	_hdActive = _hdPack || _hdRecorder;
 }
 
@@ -56,6 +57,9 @@ SnesPpu::~SnesPpu()
 	}
 	if(_hdObjectRecorder) {
 		_hdObjectRecorder->Flush();
+	}
+	if(_hdPlaneRecorder) {
+		_hdPlaneRecorder->Flush();
 	}
 	delete[] _vram;
 	delete[] _outputBuffers[0];
@@ -546,6 +550,9 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
 
 			if(_hdPack || _hdObjectRecorder) {
 				ProcessHdFrameStart();
+			}
+			if(_hdPlaneRecorder) {
+				ProcessHdPlanes();
 			}
 
 			//Ensure the SPC is re-enabled for the next frame
@@ -1052,6 +1059,13 @@ void SnesPpu::ProcessHdFrameStart()
 	//OAM is final for the frame by now (games write it during vblank), so find the HD pack's objects in it
 	memset(_hdEntryConsumed, 0, sizeof(_hdEntryConsumed));
 
+	memset(_hdMode7Tile, 0, sizeof(_hdMode7Tile));
+	if(_hdPack && _hdPack->HasMode7Tiles() && _state.BgMode == 7) {
+		for(int tile = 0; tile < 256; tile++) {
+			_hdMode7Tile[tile] = _hdPack->FindMode7Tile(_vram, (uint8_t)tile);
+		}
+	}
+
 	vector<SnesHdOamEntry> entries;
 	ReadHdOam(entries);
 	if(_hdObjectRecorder) {
@@ -1125,6 +1139,247 @@ void SnesPpu::RecordHdBgPixel(int x, uint8_t priority, uint32_t cell)
 		_hdLine[x] = cell;
 		_hdLinePriority[x] = priority;
 		_hdUnder[x] = 0;
+	}
+}
+
+static string CgramHex(const uint16_t* cgram)
+{
+	static const char digits[] = "0123456789abcdef";
+	string result;
+	for(int i = 0; i < 256; i++) {
+		for(int shift = 12; shift >= 0; shift -= 4) {
+			result += digits[(cgram[i] >> shift) & 0x0F];
+		}
+	}
+	return result;
+}
+
+static uint32_t ToArgb(uint16_t rgb)
+{
+	uint32_t r = (rgb & 0x1F) * 255 / 31;
+	uint32_t g = ((rgb >> 5) & 0x1F) * 255 / 31;
+	uint32_t b = ((rgb >> 10) & 0x1F) * 255 / 31;
+	return 0xFF000000 | (r << 16) | (g << 8) | b;
+}
+
+uint64_t SnesPpu::ComputeHdPlaneKey(uint8_t layer, uint8_t bpp)
+{
+	//A hash of what the layer holds: its geometry, every tilemap entry's flip, palette and priority bits, and the
+	//graphics of the tiles they use. Not its scroll or palette colors, which change while the picture stays.
+	LayerConfig& config = _state.Layers[layer];
+	int screensX = config.DoubleWidth ? 2 : 1;
+	int screensY = config.DoubleHeight ? 2 : 1;
+
+	auto mix = [](uint64_t& hash, uint64_t value) { hash = (hash ^ value) * 0x100000001B3ULL; };
+	uint64_t hash = 0xCBF29CE484222325ULL;
+	mix(hash, bpp);
+	mix(hash, config.LargeTiles);
+	mix(hash, screensX);
+	mix(hash, screensY);
+
+	uint64_t tileHash[1024];
+	bool known[1024] = {};
+	auto tileHashOf = [&](uint16_t tile) {
+		tile &= 0x3FF;
+		if(!known[tile]) {
+			known[tile] = true;
+			tileHash[tile] = SnesHdPack::HashTile(_vram, config.ChrAddress + tile * 4 * bpp, bpp);
+		}
+		return tileHash[tile];
+	};
+
+	for(int sy = 0; sy < screensY; sy++) {
+		for(int sx = 0; sx < screensX; sx++) {
+			uint16_t base = config.TilemapAddress + (sy ? (config.DoubleWidth ? 0x800 : 0x400) : 0) + (sx ? 0x400 : 0);
+			for(int i = 0; i < 1024; i++) {
+				uint16_t entry = _vram[(base + i) & 0x7FFF];
+				mix(hash, entry >> 10);
+				if(config.LargeTiles) {
+					for(int offset : { 0, 1, 16, 17 }) {
+						mix(hash, tileHashOf(entry + offset));
+					}
+				} else {
+					mix(hash, tileHashOf(entry));
+				}
+			}
+		}
+	}
+	return hash;
+}
+
+void SnesPpu::RenderHdPlane(uint8_t layer, uint8_t bpp, vector<uint32_t>& pixels, string& cells)
+{
+	LayerConfig& config = _state.Layers[layer];
+	int size = config.LargeTiles ? 16 : 8;
+	int width = (config.DoubleWidth ? 64 : 32) * size;
+	int height = (config.DoubleHeight ? 64 : 32) * size;
+	int columns = width / 8;
+	int rows = height / 8;
+	pixels.assign(width * height, 0);
+
+	std::map<uint16_t, int> slotOf;
+	string tiles;
+	string grid;
+	for(int cy = 0; cy < rows; cy++) {
+		for(int cx = 0; cx < columns; cx++) {
+			//The 8x8 cell's tilemap entry and, for a 16x16 tile, which of its four 8x8 tiles it is (a flip swaps them)
+			int column = cx * 8 / size;
+			int row = cy * 8 / size;
+			uint16_t base = config.TilemapAddress + ((row >> 5) ? (config.DoubleWidth ? 0x800 : 0x400) : 0) + ((column >> 5) ? 0x400 : 0);
+			uint16_t entry = _vram[(base + ((row & 0x1F) << 5) + (column & 0x1F)) & 0x7FFF];
+			bool flipH = (entry & 0x4000) != 0;
+			bool flipV = (entry & 0x8000) != 0;
+			uint16_t tile = entry & 0x3FF;
+			if(config.LargeTiles) {
+				tile += ((cy & 1) ? (flipV ? 0 : 16) : (flipV ? 16 : 0)) + ((cx & 1) ? (flipH ? 0 : 1) : (flipH ? 1 : 0));
+				tile &= 0x3FF;
+			}
+
+			uint16_t paletteBase = (_state.BgMode == 0 ? layer * 32 : 0) + (bpp == 8 ? 0 : ((entry >> 10) & 0x07) * (1 << bpp));
+			uint16_t start = config.ChrAddress + tile * 4 * bpp;
+			for(int y = 0; y < 8; y++) {
+				for(int x = 0; x < 8; x++) {
+					int shift = flipH ? x : 7 - x;
+					int rowOffset = flipV ? 7 - y : y;
+					uint8_t color = 0;
+					for(int pair = 0; pair < bpp / 2; pair++) {
+						uint16_t word = _vram[(start + rowOffset + pair * 8) & 0x7FFF];
+						color |= ((word >> shift) & 1) << (pair * 2);
+						color |= ((word >> (8 + shift)) & 1) << (pair * 2 + 1);
+					}
+					if(color != 0) {
+						pixels[(cy * 8 + y) * width + cx * 8 + x] = ToArgb(_cgram[(paletteBase + color) & 0xFF]);
+					}
+				}
+			}
+
+			auto slot = slotOf.find(tile);
+			if(slot == slotOf.end()) {
+				slot = slotOf.insert({ tile, (int)slotOf.size() }).first;
+				tiles += (slot->second ? ",\"" : "\"") + SnesHdPack::TileHex(_vram, start, bpp) + "\"";
+			}
+			grid += string(cy || cx ? "," : "") + "[" + std::to_string(slot->second) + "," + (flipH ? "1" : "0") + "," + (flipV ? "1" : "0") + "," + std::to_string(paletteBase) + "]";
+		}
+	}
+
+	cells = "{\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) + ",\"bpp\":" + std::to_string(bpp) +
+		",\"mode7\":false,\"cols\":" + std::to_string(columns) + ",\"rows\":" + std::to_string(rows) + ",\"cgram\":\"" + CgramHex(_cgram) +
+		"\",\"tiles\":[" + tiles + "],\"cells\":[" + grid + "]}";
+}
+
+void SnesPpu::RenderHdMode7Plane(vector<uint32_t>& pixels, string& cells)
+{
+	//Mode 7's plane: a 128x128 map of tile numbers in the low bytes of the first 16k words of VRAM, and 8bpp tiles of 64
+	//pixel colors in the high bytes of 64 words each
+	pixels.assign(1024 * 1024, 0);
+	std::map<uint8_t, int> slotOf;
+	string tiles;
+	string grid;
+	for(int ty = 0; ty < 128; ty++) {
+		for(int tx = 0; tx < 128; tx++) {
+			uint8_t tile = (uint8_t)_vram[(ty << 7) | tx];
+			for(int y = 0; y < 8; y++) {
+				for(int x = 0; x < 8; x++) {
+					uint8_t color = _vram[(tile << 6) | (y << 3) | x] >> 8;
+					if(color) {
+						pixels[(ty * 8 + y) * 1024 + tx * 8 + x] = ToArgb(_cgram[color]);
+					}
+				}
+			}
+
+			auto slot = slotOf.find(tile);
+			if(slot == slotOf.end()) {
+				slot = slotOf.insert({ tile, (int)slotOf.size() }).first;
+				static const char digits[] = "0123456789abcdef";
+				string hex;
+				for(int i = 0; i < 64; i++) {
+					uint8_t color = _vram[(tile << 6) | i] >> 8;
+					hex += digits[color >> 4];
+					hex += digits[color & 0x0F];
+				}
+				tiles += (slot->second ? ",\"" : "\"") + hex + "\"";
+			}
+			grid += string(ty || tx ? "," : "") + "[" + std::to_string(slot->second) + ",0,0,0]";
+		}
+	}
+	cells = "{\"width\":1024,\"height\":1024,\"bpp\":8,\"mode7\":true,\"cols\":128,\"rows\":128,\"cgram\":\"" + CgramHex(_cgram) +
+		"\",\"tiles\":[" + tiles + "],\"cells\":[" + grid + "]}";
+}
+
+void SnesPpu::ProcessHdPlanes()
+{
+	//Record the pictures the layers show in this frame. High resolution output has no single plane to a layer
+	if(IsDoubleWidth() || _state.ScreenInterlace || _state.ForcedBlank) {
+		return;
+	}
+
+	int spread = 0;
+	{
+		int low = 0x7FFFFFFF, high = 0;
+		for(int c = 0; c < 256; c++) {
+			int brightness = (_cgram[c] & 0x1F) + ((_cgram[c] >> 5) & 0x1F) + ((_cgram[c] >> 10) & 0x1F);
+			low = std::min(low, brightness);
+			high = std::max(high, brightness);
+		}
+		spread = high - low;
+	}
+
+	if(_state.BgMode == 7) {
+		if(!(_state.MainScreenLayers & 0x01)) {
+			return;
+		}
+		uint64_t key = 0xCBF29CE484222325ULL;
+		for(int i = 0; i < 0x8000; i++) {
+			key = (key ^ (_vram[i] & 0xFF)) * 0x100000001B3ULL;
+			key = (key ^ (_vram[i] >> 8)) * 0x100000001B3ULL;
+		}
+		if(_hdPlaneRecorder->Seen(key, 0, 8, 1024, 1024, _frameCount, spread)) {
+			vector<uint32_t> pixels;
+			string cells;
+			RenderHdMode7Plane(pixels, cells);
+			_hdPlaneRecorder->Write(key, pixels, 1024, 1024, cells);
+		}
+		return;
+	}
+
+	struct LayerInfo
+	{
+		uint8_t Layer;
+		uint8_t Bpp;
+	};
+	static constexpr LayerInfo mode0[] = { { 0, 2 }, { 1, 2 }, { 2, 2 }, { 3, 2 } };
+	static constexpr LayerInfo mode1[] = { { 0, 4 }, { 1, 4 }, { 2, 2 } };
+	static constexpr LayerInfo mode2[] = { { 0, 4 }, { 1, 4 } };
+	static constexpr LayerInfo mode3[] = { { 0, 8 }, { 1, 4 } };
+	static constexpr LayerInfo mode4[] = { { 0, 8 }, { 1, 2 } };
+	const LayerInfo* layers = nullptr;
+	int count = 0;
+	switch(_state.BgMode) {
+		case 0: layers = mode0; count = 4; break;
+		case 1: layers = mode1; count = 3; break;
+		case 2: layers = mode2; count = 2; break;
+		case 3: layers = mode3; count = 2; break;
+		case 4: layers = mode4; count = 2; break;
+		default: return;
+	}
+
+	for(int i = 0; i < count; i++) {
+		uint8_t layer = layers[i].Layer;
+		uint8_t bpp = layers[i].Bpp;
+		if(!((_state.MainScreenLayers >> layer) & 0x01) || (bpp == 8 && _state.DirectColorMode)) {
+			continue;
+		}
+
+		LayerConfig& config = _state.Layers[layer];
+		uint16_t width = (config.DoubleWidth ? 64 : 32) * (config.LargeTiles ? 16 : 8);
+		uint16_t height = (config.DoubleHeight ? 64 : 32) * (config.LargeTiles ? 16 : 8);
+		uint64_t key = ComputeHdPlaneKey(layer, bpp);
+		if(_hdPlaneRecorder->Seen(key, layer, bpp, width, height, _frameCount, spread)) {
+			vector<uint32_t> pixels;
+			string cells;
+			RenderHdPlane(layer, bpp, pixels, cells);
+			_hdPlaneRecorder->Write(key, pixels, width, height, cells);
+		}
 	}
 }
 
@@ -1479,6 +1734,12 @@ void SnesPpu::RenderTilemapMode7()
 
 			if(drawMain && (_mainScreenFlags[x] & 0x0F) < priority && !ProcessMaskWindow<layerIndex>(mainWindowCount, x)) {
 				DrawMainPixel(x, paletteColor, priority | pixelFlags);
+
+				if constexpr(layerIndex == 0) {
+					if(_hdPack && !applyMosaic && !directColorMode && _hdMode7Tile[tileIndex]) {
+						RecordHdBgPixel(x, priority, SnesHdCell::Make(_hdMode7Tile[tileIndex], xOffset & 7, yOffset & 7, false, false, 0, true));
+					}
+				}
 			}
 
 			if(drawSub && _subScreenPriority[x] < priority && !ProcessMaskWindow<layerIndex>(subWindowCount, x)) {
@@ -1767,8 +2028,13 @@ void SnesPpu::SendFrame()
 		memcpy(GetHdFrame()->SpritePriority, priorities[_state.BgMode & 0x07], 4);
 		frame.Data = GetHdFrame();
 	}
-	if(_hdRecorder && (_frameCount % 300) == 0) {
-		_hdRecorder->Flush();
+	if(_frameCount % 300 == 0) {
+		if(_hdRecorder) {
+			_hdRecorder->Flush();
+		}
+		if(_hdPlaneRecorder) {
+			_hdPlaneRecorder->Flush();
+		}
 	}
 	_emu->GetVideoDecoder()->UpdateFrame(frame, isRewinding, isRewinding);
 

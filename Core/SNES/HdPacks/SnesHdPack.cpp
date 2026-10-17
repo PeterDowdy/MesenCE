@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <filesystem>
 #include "SNES/HdPacks/SnesHdPack.h"
 #include "Shared/MessageManager.h"
 #include "Utilities/FolderUtilities.h"
@@ -17,6 +18,29 @@ uint64_t SnesHdPack::HashTile(const uint16_t* vram, uint16_t wordAddress, uint8_
 		hash = (hash ^ (word >> 8)) * 0x100000001B3ULL;
 	}
 	return hash;
+}
+
+uint64_t SnesHdPack::HashMode7Tile(const uint16_t* vram, uint8_t tile)
+{
+	uint64_t hash = 0x4D4F444537A5A5A5ULL; //Not the seed of a planar tile's hash, so the two can't be mistaken for each other
+	for(int i = 0; i < 64; i++) {
+		hash = (hash ^ (vram[(tile << 6) | i] >> 8)) * 0x100000001B3ULL;
+	}
+	return hash;
+}
+
+string SnesHdPack::TileHex(const uint16_t* vram, uint16_t wordAddress, uint8_t bpp)
+{
+	static const char digits[] = "0123456789abcdef";
+	string result;
+	for(int i = 0; i < bpp * 4; i++) {
+		uint16_t word = vram[(wordAddress + i) & 0x7FFF];
+		result += digits[(word >> 4) & 0x0F];
+		result += digits[word & 0x0F];
+		result += digits[(word >> 12) & 0x0F];
+		result += digits[(word >> 8) & 0x0F];
+	}
+	return result;
 }
 
 uint64_t SnesHdPack::HashPalette(const uint16_t* cgram, uint16_t paletteBase, uint8_t bpp)
@@ -165,6 +189,35 @@ static void DecodeTile(const vector<uint16_t>& words, uint8_t bpp, uint8_t* inde
 
 bool SnesHdPack::LoadTile(vector<string>& tokens, LoadState& state, bool variant)
 {
+	if(!variant && tokens.size() >= 4 && tokens[1].rfind("m7:", 0) == 0) {
+		//A tile of Mode 7's plane
+		string data = tokens[1].substr(3);
+		uint32_t imageIndex = (uint32_t)std::stoi(tokens[0]);
+		uint32_t x = (uint32_t)std::stoi(tokens[2]);
+		uint32_t y = (uint32_t)std::stoi(tokens[3]);
+		uint32_t size = 8 * Scale;
+		if(data.size() != 128 || imageIndex >= state.Images.size() || x + size > state.ImageSizes[imageIndex].first || y + size > state.ImageSizes[imageIndex].second || Tiles.size() >= 0xFFFF) {
+			MessageManager::Log("[HDPack] Invalid Mode 7 tile: " + tokens[1]);
+			return false;
+		}
+
+		uint64_t hash = 0x4D4F444537A5A5A5ULL;
+		for(int i = 0; i < 64; i++) {
+			hash = (hash ^ (uint64_t)HexUtilities::FromHex(data.substr(i * 2, 2))) * 0x100000001B3ULL;
+		}
+
+		SnesHdTile tile;
+		tile.Pixels.resize(size * size);
+		uint32_t imageWidth = state.ImageSizes[imageIndex].first;
+		for(uint32_t row = 0; row < size; row++) {
+			memcpy(tile.Pixels.data() + row * size, state.Images[imageIndex].data() + (y + row) * imageWidth + x, size * sizeof(uint32_t));
+		}
+		Tiles.push_back(std::move(tile));
+		_entries[hash].DefaultId = (uint16_t)Tiles.size();
+		_hasMode7Tiles = true;
+		return true;
+	}
+
 	size_t digits = tokens.size() >= 2 ? tokens[1].size() : 0;
 	bool validCount = variant ? tokens.size() == 5 : (tokens.size() == 4 || tokens.size() == 5);
 	if(!validCount || (digits != 32 && digits != 64 && digits != 128)) {
@@ -417,6 +470,65 @@ void SnesHdRecorder::Flush()
 	ofstream file(_path, std::ios::out | std::ios::trunc);
 	for(Row& row : _rows) {
 		file << row.Text << " " << row.FirstFrame << " " << row.Fetches << "\n";
+	}
+	_dirty = false;
+}
+
+unique_ptr<SnesHdPlaneRecorder> SnesHdPlaneRecorder::Create()
+{
+	const char* folder = std::getenv("MESEN_SNES_HD_PLANES");
+	if(!folder || !*folder) {
+		return nullptr;
+	}
+
+	unique_ptr<SnesHdPlaneRecorder> recorder(new SnesHdPlaneRecorder());
+	recorder->_folder = folder;
+	std::filesystem::create_directories(folder);
+	return recorder;
+}
+
+bool SnesHdPlaneRecorder::Seen(uint64_t key, uint8_t layer, uint8_t bpp, uint16_t width, uint16_t height, uint32_t frame, int spread)
+{
+	Plane& plane = _planes[key];
+	bool isNew = plane.Frames == 0;
+	if(isNew) {
+		plane.Layer = layer;
+		plane.Bpp = bpp;
+		plane.Width = width;
+		plane.Height = height;
+		plane.FirstFrame = frame;
+	}
+	plane.Frames++;
+	_dirty = true;
+	if(isNew || spread > plane.Spread + 8) {
+		plane.Spread = spread;
+		return true;
+	}
+	return false;
+}
+
+void SnesHdPlaneRecorder::Write(uint64_t key, const vector<uint32_t>& pixels, uint16_t width, uint16_t height, const string& cells)
+{
+	char name[48];
+	snprintf(name, sizeof(name), "plane_%016llx", (unsigned long long)key);
+	vector<uint32_t> copy(pixels);
+	PNGHelper::WritePNG((std::filesystem::path(_folder) / (string(name) + ".png")).string(), copy.data(), width, height, 32);
+	ofstream file(std::filesystem::path(_folder) / (string(name) + ".json"), std::ios::out | std::ios::trunc);
+	file << cells;
+}
+
+void SnesHdPlaneRecorder::Flush()
+{
+	if(!_dirty) {
+		return;
+	}
+
+	ofstream file(std::filesystem::path(_folder) / "planes.txt", std::ios::out | std::ios::trunc);
+	for(auto& pair : _planes) {
+		const Plane& plane = pair.second;
+		char line[160];
+		snprintf(line, sizeof(line), "P %016llx %u %u %u %u %u %u %d\n", (unsigned long long)pair.first, plane.Layer, plane.Bpp, plane.Width, plane.Height, plane.FirstFrame, plane.Frames, plane.Spread);
+		file << line;
 	}
 	_dirty = false;
 }

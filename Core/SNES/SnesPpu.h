@@ -13,6 +13,7 @@ class EmuSettings;
 class SnesHdPack;
 class SnesHdRecorder;
 class SnesHdObjectRecorder;
+class SnesHdPlaneRecorder;
 struct SnesHdOamEntry;
 struct SnesHdFrameData;
 
@@ -128,7 +129,9 @@ private:
 	SnesHdPack* _hdPack = nullptr;
 	unique_ptr<SnesHdRecorder> _hdRecorder;
 	unique_ptr<SnesHdObjectRecorder> _hdObjectRecorder;
+	unique_ptr<SnesHdPlaneRecorder> _hdPlaneRecorder;
 	bool _hdActive = false; //Whether tiles are looked up as they are fetched (there's a pack or a recorder)
+	uint16_t _hdMode7Tile[256] = {}; //The pack's art for each tile of Mode 7's plane, for this frame (0 = none)
 	bool _hdEntryConsumed[128] = {}; //OAM entries that belong to a replaced object: their pixels aren't drawn
 	uint8_t _spriteIndex[256] = {}; //The OAM entry that drew each pixel of the line's sprites
 	uint8_t _spriteIndexCopy[256] = {};
@@ -153,6 +156,10 @@ private:
 	void RecordHdPixels();
 	void RecordHdBgPixel(int x, uint8_t priority, uint32_t cell);
 	void ReadHdOam(vector<SnesHdOamEntry>& entries);
+	void ProcessHdPlanes();
+	uint64_t ComputeHdPlaneKey(uint8_t layer, uint8_t bpp);
+	void RenderHdPlane(uint8_t layer, uint8_t bpp, vector<uint32_t>& pixels, string& cells);
+	void RenderHdMode7Plane(vector<uint32_t>& pixels, string& cells);
 	void ProcessHdFrameStart();
 	uint16_t LookupHdTile(uint8_t bpp, uint16_t wordAddress, uint16_t paletteBase, bool sprite);
 	SnesHdFrameData* GetHdFrame();
