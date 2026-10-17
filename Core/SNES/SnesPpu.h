@@ -11,6 +11,7 @@ class SnesMemoryManager;
 class Spc;
 class EmuSettings;
 class SnesHdPack;
+class SnesHdRecorder;
 struct SnesHdFrameData;
 
 class SnesPpu : public ISerializable
@@ -123,11 +124,15 @@ private:
 	//HD pack: what each pixel of the line's sprite tiles is replaced with (see SnesHdCell), and the cells that
 	//won the main screen for the current chunk of the line (with the priority they were drawn at)
 	SnesHdPack* _hdPack = nullptr;
+	unique_ptr<SnesHdRecorder> _hdRecorder;
+	bool _hdActive = false; //Whether tiles are looked up as they are fetched (there's a pack or a recorder)
 	unique_ptr<SnesHdFrameData> _hdFrames[2]; //Paired with _outputBuffers: the cells of the pixels in the buffer with the same index
 	uint32_t _spriteHd[256] = {};
 	uint32_t _spriteHdCopy[256] = {};
 	uint32_t _hdLine[256] = {};
 	uint8_t _hdLinePriority[256] = {};
+	uint32_t _hdUnder[256] = {}; //The background tile under a transparent pixel of a replaced sprite tile
+	uint8_t _hdUnderPriority[256] = {};
 
 	int32_t _debugMode7StartX = 0;
 	int32_t _debugMode7StartY = 0;
@@ -138,6 +143,8 @@ private:
 
 	void RenderSprites(const uint8_t priorities[4]);
 	void RecordHdPixels();
+	void RecordHdBgPixel(int x, uint8_t priority, uint32_t cell);
+	uint16_t LookupHdTile(uint8_t bpp, uint16_t wordAddress, uint16_t paletteBase, bool sprite);
 	SnesHdFrameData* GetHdFrame();
 
 	template<bool hiResMode>

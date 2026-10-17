@@ -61,6 +61,10 @@ struct TileData
 	uint16_t TilemapData;
 	uint16_t VScroll;
 	uint16_t ChrData[4];
+
+	//Used by the HD pack: the replacement for this tile (0 = none) and the row of it that ChrData is from
+	uint16_t HdTileId;
+	uint8_t HdRow;
 };
 
 struct LayerData

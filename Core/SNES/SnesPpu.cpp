@@ -43,10 +43,15 @@ SnesPpu::SnesPpu(Emulator* emu, SnesConsole* console)
 		_hdFrames[0].reset(new SnesHdFrameData());
 		_hdFrames[1].reset(new SnesHdFrameData());
 	}
+	_hdRecorder = SnesHdRecorder::Create();
+	_hdActive = _hdPack || _hdRecorder;
 }
 
 SnesPpu::~SnesPpu()
 {
+	if(_hdRecorder) {
+		_hdRecorder->Flush();
+	}
 	delete[] _vram;
 	delete[] _outputBuffers[0];
 	delete[] _outputBuffers[1];
@@ -259,6 +264,14 @@ void SnesPpu::GetChrData(uint8_t layerIndex, uint8_t column, uint8_t plane)
 
 	uint8_t yOffset = vMirror ? (7 - baseYOffset) : baseYOffset;
 	uint16_t pixelStart = tileStart + yOffset + (plane << 3);
+
+	if constexpr(!hiResMode) {
+		if(_hdActive && plane == 0 && !secondTile) {
+			uint16_t paletteBase = (_state.BgMode == 0 ? layerIndex * 32 : 0) + (bpp == 8 ? 0 : ((tilemapData >> 10) & 0x07) * (1 << bpp));
+			tileData.HdTileId = (bpp == 8 && _state.DirectColorMode) ? 0 : LookupHdTile(bpp, tileStart, paletteBase, false);
+			tileData.HdRow = yOffset;
+		}
+	}
 	tileData.ChrData[plane + (secondTile ? bpp / 2 : 0)] = _vram[pixelStart & 0x7FFF];
 }
 
@@ -765,8 +778,8 @@ void SnesPpu::FetchSpriteAttributes(uint16_t oamAddress)
 	uint16_t tileStart = (_state.OamBaseAddress + (tileIndex << 4) + (useSecondTable ? _state.OamAddressOffset : 0));
 	_currentSprite.FetchAddress = (tileStart + yOffset) & 0x7FFF;
 
-	if(_hdPack) {
-		_currentSprite.HdTileId = _hdPack->FindTile(_vram, tileStart);
+	if(_hdActive) {
+		_currentSprite.HdTileId = LookupHdTile(4, tileStart, 128 + (_currentSprite.Palette << 4), true);
 		_currentSprite.HdRow = yOffset;
 		_currentSprite.VerticalMirror = verticalMirror;
 	}
@@ -973,14 +986,43 @@ void SnesPpu::RecordHdPixels()
 	//Fades and color math change the pixel after the fact, so those pixels keep the plain upscale.
 	uint16_t row = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
 	uint32_t* cells = GetHdFrame()->Cells.data() + row * SnesHdFrameData::Width;
+	uint32_t* under = GetHdFrame()->Under.data() + row * SnesHdFrameData::Width;
 	bool allowed = !_useHighResOutput && !_state.ForcedBlank && _state.ScreenBrightness == 15;
 
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
 		uint8_t flags = _mainScreenFlags[x];
-		bool visible = allowed && _hdLine[x] && (flags & 0x0F) <= _hdLinePriority[x] && !(flags & PixelFlags::AllowColorMath);
+		uint8_t priority = flags & 0x0F;
+		bool visible = allowed && _hdLine[x] && priority <= _hdLinePriority[x] && !(flags & PixelFlags::AllowColorMath);
+		//A transparent sprite pixel shows the background tile under it only if that tile is what ended up on screen
+		bool underVisible = visible && _hdUnder[x] && !SnesHdCell::IsBackground(_hdLine[x]) && priority == _hdUnderPriority[x];
 		cells[x] = visible ? _hdLine[x] : 0;
+		under[x] = underVisible ? _hdUnder[x] : 0;
 		_hdLine[x] = 0;
+		_hdUnder[x] = 0;
 	}
+}
+
+void SnesPpu::RecordHdBgPixel(int x, uint8_t priority, uint32_t cell)
+{
+	if(_hdLine[x] && !SnesHdCell::IsBackground(_hdLine[x]) && _hdLinePriority[x] > priority) {
+		//A sprite tile's transparent pixel is above this background pixel: the sprite's art goes over the background's
+		if(priority > _hdUnderPriority[x] || !_hdUnder[x]) {
+			_hdUnder[x] = cell;
+			_hdUnderPriority[x] = priority;
+		}
+	} else {
+		_hdLine[x] = cell;
+		_hdLinePriority[x] = priority;
+		_hdUnder[x] = 0;
+	}
+}
+
+uint16_t SnesPpu::LookupHdTile(uint8_t bpp, uint16_t wordAddress, uint16_t paletteBase, bool sprite)
+{
+	if(_hdRecorder) {
+		_hdRecorder->Record(sprite, bpp, _vram, wordAddress, _cgram, paletteBase);
+	}
+	return _hdPack ? _hdPack->FindTile(_vram, wordAddress, bpp, _cgram, paletteBase) : 0;
 }
 
 void SnesPpu::RenderBgColor()
@@ -1120,6 +1162,13 @@ void SnesPpu::RenderTilemap()
 			uint16_t rgbColor = GetRgbColor<bpp, directColorMode, basePaletteOffset>(paletteIndex, color);
 			if(drawMain && (_mainScreenFlags[x] & 0x0F) < priority && !ProcessMaskWindow<layerIndex>(mainWindowCount, x)) {
 				DrawMainPixel(x, rgbColor, priority | pixelFlags);
+
+				if constexpr(!hiResMode && !applyMosaic && !directColorMode) {
+					if(_hdPack && tileData[lookupIndex].HdTileId) {
+						uint8_t column = (x + hScroll) & 0x07;
+						RecordHdBgPixel(x, priority, SnesHdCell::Make(tileData[lookupIndex].HdTileId, hMirror ? 7 - column : column, tileData[lookupIndex].HdRow, hMirror, (tilemapData & 0x8000) != 0, 0, true));
+					}
+				}
 			}
 			if constexpr(!hiResMode) {
 				if(drawSub && _subScreenPriority[x] < priority && !ProcessMaskWindow<layerIndex>(subWindowCount, x)) {
@@ -1579,8 +1628,11 @@ void SnesPpu::SendFrame()
 		memset(_currentBuffer + width * (height - bottom), 0, width * bottom * sizeof(uint16_t));
 		if(_hdPack && !_useHighResOutput) {
 			vector<uint32_t>& cells = GetHdFrame()->Cells;
-			std::fill(cells.begin(), cells.begin() + SnesHdFrameData::Width * top, 0);
-			std::fill(cells.begin() + SnesHdFrameData::Width * (height - bottom), cells.begin() + SnesHdFrameData::Width * height, 0);
+			vector<uint32_t>& under = GetHdFrame()->Under;
+			for(vector<uint32_t>* cellVector : { &cells, &under }) {
+				std::fill(cellVector->begin(), cellVector->begin() + SnesHdFrameData::Width * top, 0);
+				std::fill(cellVector->begin() + SnesHdFrameData::Width * (height - bottom), cellVector->begin() + SnesHdFrameData::Width * height, 0);
+			}
 		}
 	}
 
@@ -1595,6 +1647,9 @@ void SnesPpu::SendFrame()
 	RenderedFrame frame(_currentBuffer, width, height, _useHighResOutput ? 0.5 : 1.0, _frameCount, _console->GetControlManager()->GetPortStates());
 	if(_hdPack) {
 		frame.Data = GetHdFrame();
+	}
+	if(_hdRecorder && (_frameCount % 300) == 0) {
+		_hdRecorder->Flush();
 	}
 	_emu->GetVideoDecoder()->UpdateFrame(frame, isRewinding, isRewinding);
 
