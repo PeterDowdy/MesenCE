@@ -2,6 +2,8 @@
 #include "SNES/SnesConsole.h"
 #include "SNES/SnesCpu.h"
 #include "SNES/SnesPpu.h"
+#include "SNES/HdPacks/SnesHdPack.h"
+#include "SNES/HdPacks/SnesHdVideoFilter.h"
 #include "SNES/Spc.h"
 #include "SNES/InternalRegisters.h"
 #include "SNES/RegisterHandlerB.h"
@@ -120,6 +122,7 @@ LoadRomResult SnesConsole::LoadRom(VirtualFile& romFile)
 
 		_internalRegisters.reset(new InternalRegisters());
 		_memoryManager.reset(new SnesMemoryManager());
+		_hdPack = SnesHdPack::Load(romFile.GetFileName());
 		_ppu.reset(new SnesPpu(_emu, this));
 		_controlManager.reset(new SnesControlManager(this));
 		_dmaController.reset(new SnesDmaController(_memoryManager.get()));
@@ -276,6 +279,10 @@ BaseVideoFilter* SnesConsole::GetVideoFilter(bool getDefaultFilter)
 {
 	if(getDefaultFilter || GetRomFormat() == RomFormat::Spc) {
 		return new SnesDefaultVideoFilter(_emu);
+	}
+
+	if(_hdPack) {
+		return new SnesHdVideoFilter(_emu, _hdPack.get());
 	}
 
 	VideoFilterType filterType = _emu->GetSettings()->GetVideoConfig().VideoFilter;

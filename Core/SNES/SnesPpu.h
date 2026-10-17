@@ -10,6 +10,8 @@ class InternalRegisters;
 class SnesMemoryManager;
 class Spc;
 class EmuSettings;
+class SnesHdPack;
+struct SnesHdFrameData;
 
 class SnesPpu : public ISerializable
 {
@@ -118,6 +120,15 @@ private:
 	uint8_t _spritePaletteCopy[256] = {};
 	uint8_t _spriteColorsCopy[256] = {};
 
+	//HD pack: what each pixel of the line's sprite tiles is replaced with (see SnesHdCell), and the cells that
+	//won the main screen for the current chunk of the line (with the priority they were drawn at)
+	SnesHdPack* _hdPack = nullptr;
+	unique_ptr<SnesHdFrameData> _hdFrames[2]; //Paired with _outputBuffers: the cells of the pixels in the buffer with the same index
+	uint32_t _spriteHd[256] = {};
+	uint32_t _spriteHdCopy[256] = {};
+	uint32_t _hdLine[256] = {};
+	uint8_t _hdLinePriority[256] = {};
+
 	int32_t _debugMode7StartX = 0;
 	int32_t _debugMode7StartY = 0;
 	int32_t _debugMode7EndX = 0;
@@ -126,6 +137,8 @@ private:
 	bool _needFullFrame = false;
 
 	void RenderSprites(const uint8_t priorities[4]);
+	void RecordHdPixels();
+	SnesHdFrameData* GetHdFrame();
 
 	template<bool hiResMode>
 	void GetTilemapData(uint8_t layerIndex, uint8_t columnIndex);

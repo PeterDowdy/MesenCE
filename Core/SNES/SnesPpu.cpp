@@ -8,6 +8,7 @@
 #include "SNES/SnesControlManager.h"
 #include "SNES/SnesDmaController.h"
 #include "SNES/Debugger/SnesPpuTools.h"
+#include "SNES/HdPacks/SnesHdPack.h"
 #include "Debugger/Debugger.h"
 #include "Shared/Emulator.h"
 #include "Shared/EmuSettings.h"
@@ -36,6 +37,12 @@ SnesPpu::SnesPpu(Emulator* emu, SnesConsole* console)
 	_outputBuffers[1] = new uint16_t[512 * 478];
 	memset(_outputBuffers[0], 0, 512 * 478 * sizeof(uint16_t));
 	memset(_outputBuffers[1], 0, 512 * 478 * sizeof(uint16_t));
+
+	_hdPack = console->GetHdPack();
+	if(_hdPack) {
+		_hdFrames[0].reset(new SnesHdFrameData());
+		_hdFrames[1].reset(new SnesHdFrameData());
+	}
 }
 
 SnesPpu::~SnesPpu()
@@ -462,6 +469,7 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
 
 			memcpy(_spritePalette, _spritePaletteCopy, sizeof(_spritePalette));
 			memcpy(_spriteColors, _spriteColorsCopy, sizeof(_spriteColors));
+			memcpy(_spriteHd, _spriteHdCopy, sizeof(_spriteHd));
 
 			memset(_spriteIndexes, 0xFF, sizeof(_spriteIndexes));
 
@@ -643,6 +651,7 @@ void SnesPpu::FetchSpriteData()
 	//From H=272 to 339, fetch a single word of CHR data on every cycle (for up to 34 sprites)
 	if(_fetchSpriteStart == 0) {
 		memset(_spritePriorityCopy, 0xFF, sizeof(_spritePriorityCopy));
+		memset(_spriteHdCopy, 0, sizeof(_spriteHdCopy));
 
 		_spriteTileCount = 0;
 		_currentSprite.Index = 0xFF;
@@ -756,6 +765,12 @@ void SnesPpu::FetchSpriteAttributes(uint16_t oamAddress)
 	uint16_t tileStart = (_state.OamBaseAddress + (tileIndex << 4) + (useSecondTable ? _state.OamAddressOffset : 0));
 	_currentSprite.FetchAddress = (tileStart + yOffset) & 0x7FFF;
 
+	if(_hdPack) {
+		_currentSprite.HdTileId = _hdPack->FindTile(_vram, tileStart);
+		_currentSprite.HdRow = yOffset;
+		_currentSprite.VerticalMirror = verticalMirror;
+	}
+
 	int16_t x = _currentSprite.X == -256 ? 0 : _currentSprite.X;
 	int16_t endTileX = x + ((columnCount - _currentSprite.ColumnOffset - 1) << 3) + 8;
 	_currentSprite.DrawX = _currentSprite.X + ((columnCount - _currentSprite.ColumnOffset - 1) << 3);
@@ -785,10 +800,17 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 			uint8_t xOffset = _currentSprite.HorizontalMirror ? ((7 - x) & 0x07) : x;
 			uint8_t color = GetTilePixelColor<4>(_currentSprite.ChrData, 7 - xOffset);
 
+			uint16_t hdTileId = _hdPack ? _currentSprite.HdTileId : 0;
+			uint32_t hdCell = hdTileId ? SnesHdCell::Make(hdTileId, xOffset, _currentSprite.HdRow, _currentSprite.HorizontalMirror, _currentSprite.VerticalMirror, _currentSprite.Priority) : 0;
+
 			if(color != 0) {
 				_spriteColorsCopy[xPos + x] = color;
 				_spritePriorityCopy[xPos + x] = _currentSprite.Priority;
 				_spritePaletteCopy[xPos + x] = _currentSprite.Palette;
+				_spriteHdCopy[xPos + x] = hdCell;
+			} else if(hdCell && _spritePriorityCopy[xPos + x] == 0xFF && _spriteHdCopy[xPos + x] == 0) {
+				//A transparent pixel of a replaced tile still takes part in the replacement (the art can reach past the original's outline)
+				_spriteHdCopy[xPos + x] = hdCell;
 			}
 		}
 	}
@@ -919,6 +941,9 @@ void SnesPpu::RenderScanline()
 
 		ApplyColorMath();
 		ApplyBrightness<true>();
+		if(_hdPack) {
+			RecordHdPixels();
+		}
 		ApplyHiResMode();
 
 		_drawStartX = _drawEndX + 1;
@@ -932,6 +957,29 @@ void SnesPpu::RenderScanline()
 			FetchSpriteData();
 		}
 		_fetchSpriteStart = _fetchSpriteEnd + 1;
+	}
+}
+
+SnesHdFrameData* SnesPpu::GetHdFrame()
+{
+	//Frames that aren't rendered (frame skip) send the previous buffer again, so the cells have to follow the buffer
+	return _hdFrames[_currentBuffer == _outputBuffers[0] ? 0 : 1].get();
+}
+
+void SnesPpu::RecordHdPixels()
+{
+	//Keep the cells of the sprites that are on screen at the end of the layer pass. The sprite layer is drawn first and
+	//anything with a higher priority then draws over it, so a cell is visible if nothing above its priority ended up there.
+	//Fades and color math change the pixel after the fact, so those pixels keep the plain upscale.
+	uint16_t row = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
+	uint32_t* cells = GetHdFrame()->Cells.data() + row * SnesHdFrameData::Width;
+	bool allowed = !_useHighResOutput && !_state.ForcedBlank && _state.ScreenBrightness == 15;
+
+	for(int x = _drawStartX; x <= _drawEndX; x++) {
+		uint8_t flags = _mainScreenFlags[x];
+		bool visible = allowed && _hdLine[x] && (flags & 0x0F) <= _hdLinePriority[x] && !(flags & PixelFlags::AllowColorMath);
+		cells[x] = visible ? _hdLine[x] : 0;
+		_hdLine[x] = 0;
 	}
 }
 
@@ -970,6 +1018,14 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 	}
 
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
+		if(_hdPack && drawMain && _spriteHd[x]) {
+			uint8_t cellPriority = priority[SnesHdCell::Priority(_spriteHd[x])];
+			if(((_mainScreenFlags[x] & 0x0F) < cellPriority) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
+				_hdLine[x] = _spriteHd[x];
+				_hdLinePriority[x] = cellPriority;
+			}
+		}
+
 		if(_spritePriority[x] <= 3) {
 			uint8_t spritePrio = priority[_spritePriority[x]];
 			if(drawMain && ((_mainScreenFlags[x] & 0x0F) < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
@@ -1521,6 +1577,11 @@ void SnesPpu::SendFrame()
 		int bottom = (_useHighResOutput ? 16 : 8);
 		memset(_currentBuffer, 0, width * top * sizeof(uint16_t));
 		memset(_currentBuffer + width * (height - bottom), 0, width * bottom * sizeof(uint16_t));
+		if(_hdPack && !_useHighResOutput) {
+			vector<uint32_t>& cells = GetHdFrame()->Cells;
+			std::fill(cells.begin(), cells.begin() + SnesHdFrameData::Width * top, 0);
+			std::fill(cells.begin() + SnesHdFrameData::Width * (height - bottom), cells.begin() + SnesHdFrameData::Width * height, 0);
+		}
 	}
 
 	_emu->GetNotificationManager()->SendNotification(ConsoleNotificationType::PpuFrameDone);
@@ -1532,6 +1593,9 @@ void SnesPpu::SendFrame()
 	_needFullFrame = false;
 
 	RenderedFrame frame(_currentBuffer, width, height, _useHighResOutput ? 0.5 : 1.0, _frameCount, _console->GetControlManager()->GetPortStates());
+	if(_hdPack) {
+		frame.Data = GetHdFrame();
+	}
 	_emu->GetVideoDecoder()->UpdateFrame(frame, isRewinding, isRewinding);
 
 	if(!_skipRender) {

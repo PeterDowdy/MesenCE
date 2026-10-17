@@ -35,6 +35,11 @@ struct SpriteInfo
 	uint16_t FetchAddress;
 	uint16_t ChrData[2];
 
+	//Used by the HD pack: the replacement for the tile being fetched (0 = none), its row, and whether it's flipped vertically
+	uint16_t HdTileId;
+	uint8_t HdRow;
+	bool VerticalMirror;
+
 	bool IsVisible(uint16_t scanline, bool interlace)
 	{
 		if(X != -256 && (X + Width <= 0 || X > 255)) {

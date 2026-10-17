@@ -30,6 +30,7 @@ class MovieManager;
 class FrameLimiter;
 class DebugStats;
 class Msu1;
+class SnesHdPack;
 
 class Emulator;
 
@@ -52,6 +53,7 @@ private:
 	unique_ptr<SnesDmaController> _dmaController;
 
 	unique_ptr<Msu1> _msu1;
+	unique_ptr<SnesHdPack> _hdPack;
 	EmuSettings* _settings = nullptr;
 	Emulator* _emu = nullptr;
 
@@ -93,6 +95,7 @@ public:
 
 	SnesCpu* GetCpu();
 	SnesPpu* GetPpu();
+	SnesHdPack* GetHdPack() { return _hdPack.get(); }
 	Spc* GetSpc();
 	BaseCartridge* GetCartridge();
 	SnesMemoryManager* GetMemoryManager();
