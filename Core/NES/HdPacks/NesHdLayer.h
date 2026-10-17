@@ -3,6 +3,7 @@
 #include "NES/HdPacks/HdData.h"
 #include "SNES/HdPacks/SnesHdPack.h"
 #include "SNES/HdPacks/SnesHdObjects.h"
+#include "SNES/HdPacks/SnesHdNeighbours.h"
 
 class BaseMapper;
 
@@ -32,6 +33,9 @@ public:
 	//The sprite that shows at this pixel (an index into pixel.Sprite), or -1. "suppress" holds the OAM entries that don't
 	//count because an object replaces them (can be null)
 	static int SpriteAt(const HdScreenInfo& info, const HdPpuPixelInfo& pixel, uint32_t x, uint32_t y, const bool* suppress);
+
+	//The background tiles drawn in the frame, with where each one's corner is on screen, for the neighbour recorder
+	void BuildNeighbourTiles(HdScreenInfo& info, SnesHdNeighbourRecorder& recorder, vector<SnesHdNeighbourTile>& tiles);
 
 	//The OAM entries as the object matcher and recorder want them
 	void BuildEntries(const HdScreenInfo& info, vector<SnesHdOamEntry>& entries);
@@ -65,6 +69,7 @@ public:
 	void Flush();
 };
 
+//MESEN_NES_HD_NEIGHBOURS=<file> is SnesHdNeighbourRecorder's, fed here with the background tiles each pixel shows.
 //MESEN_NES_HD_RECORD=<file> (tiles, as SnesHdRecorder writes them for the SNES) and MESEN_NES_HD_OBJECTS=<folder> (as
 //SnesHdObjectRecorder), taken from the frames the HD PPU records
 class NesHdRecorders
@@ -73,6 +78,7 @@ private:
 	unique_ptr<SnesHdRecorder> _tiles;
 	unique_ptr<SnesHdObjectRecorder> _objects;
 	unique_ptr<NesHdPlaneRecorder> _planes;
+	unique_ptr<SnesHdNeighbourRecorder> _neighbours;
 	NesHdLayer* _layer = nullptr;
 	uint32_t _palette[512] = {};
 	uint8_t _currentPalette[16] = {}; //The sprite palettes of the frame being recorded

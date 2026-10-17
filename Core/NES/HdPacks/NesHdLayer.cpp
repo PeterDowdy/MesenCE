@@ -100,6 +100,38 @@ uint8_t NesHdLayer::BackdropColor(const HdPpuPixelInfo& pixel, bool* opaque)
 	return *opaque ? pixel.Tile.BgColor : pixel.Tile.PpuBackgroundColor;
 }
 
+void NesHdLayer::BuildNeighbourTiles(HdScreenInfo& info, SnesHdNeighbourRecorder& recorder, vector<SnesHdNeighbourTile>& tiles)
+{
+	constexpr int Width = NesConstants::ScreenWidth;
+	constexpr int Height = NesConstants::ScreenHeight;
+	std::unordered_set<uint32_t> seen;
+	for(int y = 0; y < Height; y++) {
+		for(int x = 0; x < Width; x++) {
+			const HdPpuTileInfo& tile = info.ScreenTiles[y * Width + x].Tile;
+			if(tile.TileIndex == HdPpuTileInfo::NoTile) {
+				continue;
+			}
+
+			int cornerX = x - tile.OffsetX;
+			int cornerY = y - tile.OffsetY;
+			if(!seen.insert(((uint32_t)(cornerX + 64) << 16) | (uint32_t)(cornerY + 64)).second) {
+				continue;
+			}
+
+			uint8_t chr[16];
+			if(_chrRom) {
+				ReadChr(tile.TileIndex, chr);
+			} else {
+				memcpy(chr, tile.TileData, 16);
+			}
+			uint32_t number = recorder.TileNumber(SnesHdPack::HashNesTile(chr), [&]() { return "2 " + SnesHdPack::NesTileHex(chr); });
+			if(number) {
+				tiles.push_back({ (int16_t)cornerX, (int16_t)cornerY, number, false, false });
+			}
+		}
+	}
+}
+
 void NesHdLayer::BuildEntries(const HdScreenInfo& info, vector<SnesHdOamEntry>& entries)
 {
 	entries.clear();
@@ -242,7 +274,8 @@ bool NesHdRecorders::Requested()
 {
 	const char* tiles = std::getenv("MESEN_NES_HD_RECORD");
 	const char* objects = std::getenv("MESEN_NES_HD_OBJECTS");
-	return (tiles && *tiles) || (objects && *objects) || NesHdPlaneRecorder::Requested();
+	const char* neighbours = std::getenv("MESEN_NES_HD_NEIGHBOURS");
+	return (tiles && *tiles) || (objects && *objects) || (neighbours && *neighbours) || NesHdPlaneRecorder::Requested();
 }
 
 NesHdRecorders::NesHdRecorders(NesHdLayer* layer, BaseMapper* mapper, NesConfig& config)
@@ -254,6 +287,7 @@ NesHdRecorders::NesHdRecorders(NesHdLayer* layer, BaseMapper* mapper, NesConfig&
 	NesDefaultVideoFilter::GetFullPalette(_palette, config, PpuModel::Ppu2C02);
 	_tiles = SnesHdRecorder::Create(true);
 	_objects = SnesHdObjectRecorder::Create(true);
+	_neighbours = SnesHdNeighbourRecorder::Create(true);
 }
 
 NesHdRecorders::~NesHdRecorders()
@@ -272,12 +306,20 @@ void NesHdRecorders::Flush()
 	if(_planes) {
 		_planes->Flush();
 	}
+	if(_neighbours) {
+		_neighbours->Flush();
+	}
 }
 
 void NesHdRecorders::Record(HdScreenInfo& info, const uint16_t* ppuBuffer)
 {
 	if(_planes) {
 		_planes->Record(info);
+	}
+	if(_neighbours && _neighbours->Due(info.FrameNumber)) {
+		vector<SnesHdNeighbourTile> tiles;
+		_layer->BuildNeighbourTiles(info, *_neighbours, tiles);
+		_neighbours->Frame(tiles);
 	}
 
 	if(_tiles) {

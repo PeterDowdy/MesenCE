@@ -13,6 +13,7 @@ class EmuSettings;
 class SnesHdPack;
 class SnesHdRecorder;
 class SnesHdObjectRecorder;
+class SnesHdNeighbourRecorder;
 class SnesHdPlaneRecorder;
 struct SnesHdOamEntry;
 struct SnesHdFrameData;
@@ -130,6 +131,8 @@ private:
 	unique_ptr<SnesHdRecorder> _hdRecorder;
 	unique_ptr<SnesHdObjectRecorder> _hdObjectRecorder;
 	unique_ptr<SnesHdPlaneRecorder> _hdPlaneRecorder;
+	unique_ptr<SnesHdNeighbourRecorder> _hdNeighbours; //With no pack: tiles are numbered by it and the cells of the frame feed it
+	bool _hdCells = false; //Whether the pixels' cells are recorded (there's a pack, or a neighbour recorder)
 	bool _hdActive = false; //Whether tiles are looked up as they are fetched (there's a pack or a recorder)
 	uint16_t _hdMode7Tile[256] = {}; //The pack's art for each tile of Mode 7's plane, for this frame (0 = none)
 	bool _hdEntryConsumed[128] = {}; //OAM entries that belong to a replaced object: their pixels aren't drawn

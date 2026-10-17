@@ -10,6 +10,7 @@
 #include "SNES/Debugger/SnesPpuTools.h"
 #include "SNES/HdPacks/SnesHdPack.h"
 #include "SNES/HdPacks/SnesHdObjects.h"
+#include "SNES/HdPacks/SnesHdNeighbours.h"
 #include "Debugger/Debugger.h"
 #include "Shared/Emulator.h"
 #include "Shared/EmuSettings.h"
@@ -40,14 +41,18 @@ SnesPpu::SnesPpu(Emulator* emu, SnesConsole* console)
 	memset(_outputBuffers[1], 0, 512 * 478 * sizeof(uint16_t));
 
 	_hdPack = console->GetHdPack();
-	if(_hdPack) {
+	if(!_hdPack) {
+		_hdNeighbours = SnesHdNeighbourRecorder::Create(false);
+	}
+	_hdCells = _hdPack || _hdNeighbours;
+	if(_hdCells) {
 		_hdFrames[0].reset(new SnesHdFrameData());
 		_hdFrames[1].reset(new SnesHdFrameData());
 	}
 	_hdRecorder = SnesHdRecorder::Create();
 	_hdObjectRecorder = SnesHdObjectRecorder::Create();
 	_hdPlaneRecorder = SnesHdPlaneRecorder::Create();
-	_hdActive = _hdPack || _hdRecorder;
+	_hdActive = _hdPack || _hdRecorder || _hdNeighbours;
 }
 
 SnesPpu::~SnesPpu()
@@ -60,6 +65,9 @@ SnesPpu::~SnesPpu()
 	}
 	if(_hdPlaneRecorder) {
 		_hdPlaneRecorder->Flush();
+	}
+	if(_hdNeighbours) {
+		_hdNeighbours->Flush();
 	}
 	delete[] _vram;
 	delete[] _outputBuffers[0];
@@ -977,7 +985,7 @@ void SnesPpu::RenderScanline()
 
 		ApplyColorMath();
 		ApplyBrightness<true>();
-		if(_hdPack) {
+		if(_hdCells) {
 			RecordHdPixels();
 		}
 		ApplyHiResMode();
@@ -1388,6 +1396,9 @@ uint16_t SnesPpu::LookupHdTile(uint8_t bpp, uint16_t wordAddress, uint16_t palet
 	if(_hdRecorder) {
 		_hdRecorder->Record(sprite, bpp, _vram, wordAddress, _cgram, paletteBase, _frameCount);
 	}
+	if(_hdNeighbours && !sprite) {
+		return (uint16_t)_hdNeighbours->TileNumber(SnesHdPack::HashTile(_vram, wordAddress, bpp), [&]() { return std::to_string(bpp) + " " + SnesHdPack::TileHex(_vram, wordAddress, bpp); });
+	}
 	return _hdPack ? _hdPack->FindTile(_vram, wordAddress, bpp, _cgram, paletteBase) : 0;
 }
 
@@ -1532,7 +1543,7 @@ void SnesPpu::RenderTilemap()
 				DrawMainPixel(x, rgbColor, priority | pixelFlags);
 
 				if constexpr(!hiResMode && !applyMosaic && !directColorMode) {
-					if(_hdPack && tileData[lookupIndex].HdTileId) {
+					if(_hdCells && tileData[lookupIndex].HdTileId) {
 						uint8_t column = (x + hScroll) & 0x07;
 						RecordHdBgPixel(x, priority, SnesHdCell::Make(tileData[lookupIndex].HdTileId, hMirror ? 7 - column : column, tileData[lookupIndex].HdRow, hMirror, (tilemapData & 0x8000) != 0, 0, true));
 					}
@@ -2000,7 +2011,7 @@ void SnesPpu::SendFrame()
 		int bottom = (_useHighResOutput ? 16 : 8);
 		memset(_currentBuffer, 0, width * top * sizeof(uint16_t));
 		memset(_currentBuffer + width * (height - bottom), 0, width * bottom * sizeof(uint16_t));
-		if(_hdPack && !_useHighResOutput) {
+		if(_hdCells && !_useHighResOutput) {
 			SnesHdFrameData* hdFrame = GetHdFrame();
 			for(vector<uint32_t>* cellVector : { &hdFrame->Cells, &hdFrame->Under }) {
 				std::fill(cellVector->begin(), cellVector->begin() + SnesHdFrameData::Width * top, 0);
@@ -2027,6 +2038,14 @@ void SnesPpu::SendFrame()
 		static constexpr uint8_t priorities[8][4] = { { 3, 6, 9, 12 }, { 2, 4, 7, 10 }, { 2, 4, 6, 8 }, { 2, 4, 6, 8 }, { 2, 4, 6, 8 }, { 2, 4, 6, 8 }, { 2, 3, 4, 6 }, { 2, 4, 6, 7 } };
 		memcpy(GetHdFrame()->SpritePriority, priorities[_state.BgMode & 0x07], 4);
 		frame.Data = GetHdFrame();
+	}
+	if(_hdNeighbours) {
+		if(!_useHighResOutput && _hdNeighbours->Due(_frameCount)) {
+			_hdNeighbours->FrameFromCells(GetHdFrame()->Cells.data(), SnesHdFrameData::Width, SnesHdFrameData::Height);
+		}
+		if(_frameCount % 300 == 0) {
+			_hdNeighbours->Flush();
+		}
 	}
 	if(_frameCount % 300 == 0) {
 		if(_hdRecorder) {
