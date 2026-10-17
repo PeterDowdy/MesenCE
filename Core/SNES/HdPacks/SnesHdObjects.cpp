@@ -333,9 +333,11 @@ void SnesHdObjectRecorder::Record(uint32_t frame, const vector<SnesHdOamEntry>& 
 		record.Seen++;
 		record.LastFrame = frame;
 
-		//Where the stored orientation's box sits on screen: its top left corner
-		char line[96];
-		snprintf(line, sizeof(line), "F %u o%05u %d %d %d\n", frame, record.Id, minX, minY, bestOrientation);
+		//Where the stored orientation's box sits on screen (its top left corner), then the sprite palette and the OAM
+		//index of the entry with the lowest one: a character keeps its palette and, mostly, its place in OAM
+		const SnesHdOamEntry* first = *std::min_element(cluster.begin(), cluster.end(), [](const SnesHdOamEntry* a, const SnesHdOamEntry* b) { return a->Index < b->Index; });
+		char line[112];
+		snprintf(line, sizeof(line), "F %u o%05u %d %d %d %d %d\n", frame, record.Id, minX, minY, bestOrientation, first->Palette, first->Index);
 		_frameLog += line;
 		_dirty = true;
 	}

@@ -37,7 +37,7 @@ public:
 //  objects.txt  one "O" line per distinct object (id, how often it was seen, its box) and one "E" line per entry
 //  png/<id>.png the object at the original resolution, in the palette it was first seen with
 //  png/<id>_idx.png  R = the entry that drew each pixel, G = its color index (0 = none)
-//  frames.txt   "F <frame> <id> <x> <y> <orientation>" for every object on screen in every frame
+//  frames.txt   "F <frame> <id> <x> <y> <orientation> <palette> <oam index>" for every object on screen in every frame
 //Objects are groups of OAM entries that are next to each other in OAM and on screen. An object that is drawn mirrored
 //is the same object: the files hold it in whichever orientation sorts first.
 class SnesHdObjectRecorder
