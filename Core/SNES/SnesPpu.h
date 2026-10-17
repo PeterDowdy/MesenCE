@@ -12,6 +12,8 @@ class Spc;
 class EmuSettings;
 class SnesHdPack;
 class SnesHdRecorder;
+class SnesHdObjectRecorder;
+struct SnesHdOamEntry;
 struct SnesHdFrameData;
 
 class SnesPpu : public ISerializable
@@ -125,7 +127,13 @@ private:
 	//won the main screen for the current chunk of the line (with the priority they were drawn at)
 	SnesHdPack* _hdPack = nullptr;
 	unique_ptr<SnesHdRecorder> _hdRecorder;
+	unique_ptr<SnesHdObjectRecorder> _hdObjectRecorder;
 	bool _hdActive = false; //Whether tiles are looked up as they are fetched (there's a pack or a recorder)
+	bool _hdEntryConsumed[128] = {}; //OAM entries that belong to a replaced object: their pixels aren't drawn
+	uint8_t _spriteIndex[256] = {}; //The OAM entry that drew each pixel of the line's sprites
+	uint8_t _spriteIndexCopy[256] = {};
+	uint16_t _hdSpriteOwner[256] = {}; //Set where a sprite won the main screen, for the chunk being drawn
+	bool _hdSpriteWrote[256] = {};
 	unique_ptr<SnesHdFrameData> _hdFrames[2]; //Paired with _outputBuffers: the cells of the pixels in the buffer with the same index
 	uint32_t _spriteHd[256] = {};
 	uint32_t _spriteHdCopy[256] = {};
@@ -144,6 +152,8 @@ private:
 	void RenderSprites(const uint8_t priorities[4]);
 	void RecordHdPixels();
 	void RecordHdBgPixel(int x, uint8_t priority, uint32_t cell);
+	void ReadHdOam(vector<SnesHdOamEntry>& entries);
+	void ProcessHdFrameStart();
 	uint16_t LookupHdTile(uint8_t bpp, uint16_t wordAddress, uint16_t paletteBase, bool sprite);
 	SnesHdFrameData* GetHdFrame();
 

@@ -9,6 +9,7 @@
 #include "SNES/SnesDmaController.h"
 #include "SNES/Debugger/SnesPpuTools.h"
 #include "SNES/HdPacks/SnesHdPack.h"
+#include "SNES/HdPacks/SnesHdObjects.h"
 #include "Debugger/Debugger.h"
 #include "Shared/Emulator.h"
 #include "Shared/EmuSettings.h"
@@ -44,6 +45,7 @@ SnesPpu::SnesPpu(Emulator* emu, SnesConsole* console)
 		_hdFrames[1].reset(new SnesHdFrameData());
 	}
 	_hdRecorder = SnesHdRecorder::Create();
+	_hdObjectRecorder = SnesHdObjectRecorder::Create();
 	_hdActive = _hdPack || _hdRecorder;
 }
 
@@ -51,6 +53,9 @@ SnesPpu::~SnesPpu()
 {
 	if(_hdRecorder) {
 		_hdRecorder->Flush();
+	}
+	if(_hdObjectRecorder) {
+		_hdObjectRecorder->Flush();
 	}
 	delete[] _vram;
 	delete[] _outputBuffers[0];
@@ -483,6 +488,7 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
 			memcpy(_spritePalette, _spritePaletteCopy, sizeof(_spritePalette));
 			memcpy(_spriteColors, _spriteColorsCopy, sizeof(_spriteColors));
 			memcpy(_spriteHd, _spriteHdCopy, sizeof(_spriteHd));
+			memcpy(_spriteIndex, _spriteIndexCopy, sizeof(_spriteIndex));
 
 			memset(_spriteIndexes, 0xFF, sizeof(_spriteIndexes));
 
@@ -536,6 +542,10 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
 
 			if(_emu->IsRunAheadFrame()) {
 				_skipRender = true;
+			}
+
+			if(_hdPack || _hdObjectRecorder) {
+				ProcessHdFrameStart();
 			}
 
 			//Ensure the SPC is re-enabled for the next frame
@@ -810,6 +820,11 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 				continue;
 			}
 
+			if(_hdPack && _currentSprite.Index < 128 && _hdEntryConsumed[_currentSprite.Index]) {
+				//Part of an object the HD pack draws as a whole
+				continue;
+			}
+
 			uint8_t xOffset = _currentSprite.HorizontalMirror ? ((7 - x) & 0x07) : x;
 			uint8_t color = GetTilePixelColor<4>(_currentSprite.ChrData, 7 - xOffset);
 
@@ -821,6 +836,7 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
 				_spritePriorityCopy[xPos + x] = _currentSprite.Priority;
 				_spritePaletteCopy[xPos + x] = _currentSprite.Palette;
 				_spriteHdCopy[xPos + x] = hdCell;
+				_spriteIndexCopy[xPos + x] = _currentSprite.Index;
 			} else if(hdCell && _spritePriorityCopy[xPos + x] == 0xFF && _spriteHdCopy[xPos + x] == 0) {
 				//A transparent pixel of a replaced tile still takes part in the replacement (the art can reach past the original's outline)
 				_spriteHdCopy[xPos + x] = hdCell;
@@ -973,6 +989,91 @@ void SnesPpu::RenderScanline()
 	}
 }
 
+void SnesPpu::ReadHdOam(vector<SnesHdOamEntry>& entries)
+{
+	static constexpr uint8_t oamWidth[16] = { 8, 8, 8, 16, 16, 32, 16, 16, 16, 32, 64, 32, 64, 64, 32, 32 };
+	static constexpr uint8_t oamHeight[16] = { 8, 8, 8, 16, 16, 32, 32, 32, 16, 32, 64, 32, 64, 64, 64, 32 };
+
+	//OAM Y is the line before the sprite's first one, and a 224 line picture sits 7 rows down in the frame buffer
+	int rowOffset = _state.OverscanMode ? 0 : 7;
+	int visibleRows = _state.OverscanMode ? 239 : 224;
+
+	for(int i = 0; i < 128; i++) {
+		uint8_t high = _oamRam[0x200 | (i >> 2)] >> ((i << 1) & 0x06);
+
+		SnesHdOamEntry entry;
+		entry.Index = (uint8_t)i;
+		entry.X = (int16_t)(((high & 0x01) ? 0xFF00 : 0) | _oamRam[i << 2]);
+
+		uint8_t mode = _state.OamMode | ((high & 0x02) << 2);
+		entry.Width = oamWidth[mode];
+		entry.Height = oamHeight[mode];
+
+		uint8_t rawY = _oamRam[(i << 2) + 1];
+		entry.Y = (int16_t)((rawY + entry.Height > 256 ? rawY - 256 : rawY) + rowOffset);
+		if(entry.X + entry.Width <= 0 || entry.X >= 256 || entry.Y + entry.Height <= rowOffset || entry.Y >= rowOffset + visibleRows) {
+			//Not on screen: games park the sprites they don't use below the picture
+			continue;
+		}
+
+		uint8_t tile = _oamRam[(i << 2) + 2];
+		uint8_t attributes = _oamRam[(i << 2) + 3];
+		entry.Palette = (attributes >> 1) & 0x07;
+		entry.Priority = (attributes >> 4) & 0x03;
+		entry.FlipH = (attributes & 0x40) != 0;
+		entry.FlipV = (attributes & 0x80) != 0;
+
+		//Hash the CHR data of its tiles in the order they're stored, so a flip doesn't change it
+		uint64_t hash = 0xCBF29CE484222325ULL;
+		int columns = entry.Width / 8;
+		int rows = entry.Height / 8;
+		hash = (hash ^ columns) * 0x100000001B3ULL;
+		hash = (hash ^ rows) * 0x100000001B3ULL;
+		for(int cy = 0; cy < rows; cy++) {
+			for(int cx = 0; cx < columns; cx++) {
+				uint8_t row = (((tile >> 4) + cy) & 0x0F);
+				uint8_t column = ((tile & 0x0F) + cx) & 0x0F;
+				uint16_t address = (_state.OamBaseAddress + (((row << 4) | column) << 4) + ((attributes & 0x01) ? _state.OamAddressOffset : 0)) & 0x7FFF;
+				entry.Cells[entry.CellCount++] = address;
+				for(int k = 0; k < 16; k++) {
+					uint16_t word = _vram[(address + k) & 0x7FFF];
+					hash = (hash ^ (word & 0xFF)) * 0x100000001B3ULL;
+					hash = (hash ^ (word >> 8)) * 0x100000001B3ULL;
+				}
+			}
+		}
+		entry.Signature = hash;
+		entries.push_back(entry);
+	}
+}
+
+void SnesPpu::ProcessHdFrameStart()
+{
+	//OAM is final for the frame by now (games write it during vblank), so find the HD pack's objects in it
+	memset(_hdEntryConsumed, 0, sizeof(_hdEntryConsumed));
+
+	vector<SnesHdOamEntry> entries;
+	ReadHdOam(entries);
+	if(_hdObjectRecorder) {
+		_hdObjectRecorder->Record(_frameCount, entries, _vram, _cgram);
+	}
+
+	if(!_hdPack || !_hdPack->HasObjects() || _skipRender || IsDoubleWidth() || _state.ScreenInterlace) {
+		return;
+	}
+
+	//The frame is drawn in the buffer the PPU isn't showing now
+	SnesHdFrameData* data = _hdFrames[_currentBuffer == _outputBuffers[0] ? 1 : 0].get();
+	data->Objects.clear();
+
+	if(_state.ColorMathEnabled & 0x10) {
+		//Color math applies to the sprites that use palettes 4 to 7, and art drawn over the frame wouldn't blend: leave those as the game draws them
+		entries.erase(std::remove_if(entries.begin(), entries.end(), [](const SnesHdOamEntry& entry) { return entry.Palette >= 4; }), entries.end());
+	}
+	SnesHdObjectMatcher::Match(*_hdPack, entries, data->Objects, _hdEntryConsumed);
+	memcpy(data->SpritePalette, _cgram + 128, sizeof(data->SpritePalette));
+}
+
 SnesHdFrameData* SnesPpu::GetHdFrame()
 {
 	//Frames that aren't rendered (frame skip) send the previous buffer again, so the cells have to follow the buffer
@@ -987,12 +1088,22 @@ void SnesPpu::RecordHdPixels()
 	uint16_t row = _overscanFrame ? (_scanline - 1) : (_scanline + 6);
 	uint32_t* cells = GetHdFrame()->Cells.data() + row * SnesHdFrameData::Width;
 	uint32_t* under = GetHdFrame()->Under.data() + row * SnesHdFrameData::Width;
-	bool allowed = !_useHighResOutput && !_state.ForcedBlank && _state.ScreenBrightness == 15;
+	bool allowed = !_useHighResOutput && !_state.ForcedBlank;
+	uint16_t* owners = GetHdFrame()->Owner.data() + row * SnesHdFrameData::Width;
+	bool spritesOn = ((_state.MainScreenLayers & _configVisibleLayers) >> SnesPpu::SpriteLayerIndex) & 0x01;
+	uint8_t spriteWindowCount = _state.WindowMaskMain[SnesPpu::SpriteLayerIndex] ? (uint8_t)_state.Window[0].ActiveLayers[SnesPpu::SpriteLayerIndex] + (uint8_t)_state.Window[1].ActiveLayers[SnesPpu::SpriteLayerIndex] : 0;
+	uint8_t colorWindowCount = (uint8_t)_state.Window[0].ActiveLayers[SnesPpu::ColorWindowIndex] + (uint8_t)_state.Window[1].ActiveLayers[SnesPpu::ColorWindowIndex];
+	GetHdFrame()->Brightness[row] = _state.ForcedBlank ? 0 : _state.ScreenBrightness;
 
 	for(int x = _drawStartX; x <= _drawEndX; x++) {
 		uint8_t flags = _mainScreenFlags[x];
 		uint8_t priority = flags & 0x0F;
-		bool visible = allowed && _hdLine[x] && priority <= _hdLinePriority[x] && !(flags & PixelFlags::AllowColorMath);
+		bool visible = allowed && _hdLine[x] && priority <= _hdLinePriority[x];
+		bool spriteMasked = !spritesOn || (spriteWindowCount && ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(spriteWindowCount, x));
+		bool inColorWindow = colorWindowCount && ProcessMaskWindow<SnesPpu::ColorWindowIndex>(colorWindowCount, x);
+		bool clipped = _state.ColorMathClipMode == ColorWindowMode::Always || (_state.ColorMathClipMode == ColorWindowMode::OutsideWindow && !inColorWindow) || (_state.ColorMathClipMode == ColorWindowMode::InsideWindow && inColorWindow);
+		owners[x] = ((_hdSpriteWrote[x] && priority == SnesHdOwner::Priority(_hdSpriteOwner[x])) ? _hdSpriteOwner[x] : priority) | ((spriteMasked || clipped) ? SnesHdOwner::Masked : 0);
+		_hdSpriteWrote[x] = false;
 		//A transparent sprite pixel shows the background tile under it only if that tile is what ended up on screen
 		bool underVisible = visible && _hdUnder[x] && !SnesHdCell::IsBackground(_hdLine[x]) && priority == _hdUnderPriority[x];
 		cells[x] = visible ? _hdLine[x] : 0;
@@ -1073,6 +1184,8 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
 			if(drawMain && ((_mainScreenFlags[x] & 0x0F) < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
 				uint16_t paletteRamOffset = 128 + (_spritePalette[x] << 4) + _spriteColors[x];
 				_mainScreenBuffer[x] = _cgram[paletteRamOffset];
+				_hdSpriteOwner[x] = SnesHdOwner::Sprite(spritePrio, _spriteIndex[x]);
+				_hdSpriteWrote[x] = true;
 				_mainScreenFlags[x] = spritePrio | (((_state.ColorMathEnabled & 0x10) && _spritePalette[x] > 3) ? PixelFlags::AllowColorMath : 0);
 			}
 
@@ -1627,12 +1740,15 @@ void SnesPpu::SendFrame()
 		memset(_currentBuffer, 0, width * top * sizeof(uint16_t));
 		memset(_currentBuffer + width * (height - bottom), 0, width * bottom * sizeof(uint16_t));
 		if(_hdPack && !_useHighResOutput) {
-			vector<uint32_t>& cells = GetHdFrame()->Cells;
-			vector<uint32_t>& under = GetHdFrame()->Under;
-			for(vector<uint32_t>* cellVector : { &cells, &under }) {
+			SnesHdFrameData* hdFrame = GetHdFrame();
+			for(vector<uint32_t>* cellVector : { &hdFrame->Cells, &hdFrame->Under }) {
 				std::fill(cellVector->begin(), cellVector->begin() + SnesHdFrameData::Width * top, 0);
 				std::fill(cellVector->begin() + SnesHdFrameData::Width * (height - bottom), cellVector->begin() + SnesHdFrameData::Width * height, 0);
 			}
+			std::fill(hdFrame->Owner.begin(), hdFrame->Owner.begin() + SnesHdFrameData::Width * top, SnesHdOwner::Hidden);
+			std::fill(hdFrame->Owner.begin() + SnesHdFrameData::Width * (height - bottom), hdFrame->Owner.begin() + SnesHdFrameData::Width * height, SnesHdOwner::Hidden);
+			memset(hdFrame->Brightness, 0, top);
+			memset(hdFrame->Brightness + (height - bottom), 0, bottom);
 		}
 	}
 
@@ -1646,6 +1762,9 @@ void SnesPpu::SendFrame()
 
 	RenderedFrame frame(_currentBuffer, width, height, _useHighResOutput ? 0.5 : 1.0, _frameCount, _console->GetControlManager()->GetPortStates());
 	if(_hdPack) {
+		//The priority number of each sprite priority depends on the BG mode (see RenderMode0 and the others)
+		static constexpr uint8_t priorities[8][4] = { { 3, 6, 9, 12 }, { 2, 4, 7, 10 }, { 2, 4, 6, 8 }, { 2, 4, 6, 8 }, { 2, 4, 6, 8 }, { 2, 4, 6, 8 }, { 2, 3, 4, 6 }, { 2, 4, 6, 7 } };
+		memcpy(GetHdFrame()->SpritePriority, priorities[_state.BgMode & 0x07], 4);
 		frame.Data = GetHdFrame();
 	}
 	if(_hdRecorder && (_frameCount % 300) == 0) {

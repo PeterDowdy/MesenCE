@@ -5,6 +5,7 @@
 #include "Utilities/HexUtilities.h"
 #include "Utilities/PNGHelper.h"
 #include "Utilities/StringUtilities.h"
+#include <deque>
 
 uint64_t SnesHdPack::HashTile(const uint16_t* vram, uint16_t wordAddress, uint8_t bpp)
 {
@@ -42,7 +43,7 @@ unique_ptr<SnesHdPack> SnesHdPack::Load(const string& romFileName)
 		return nullptr;
 	}
 
-	MessageManager::Log("[HDPack] SNES HD pack loaded: " + definitionFile + " (scale " + std::to_string(pack->Scale) + ", " + std::to_string(pack->Tiles.size()) + " tiles)");
+	MessageManager::Log("[HDPack] SNES HD pack loaded: " + definitionFile + " (scale " + std::to_string(pack->Scale) + ", " + std::to_string(pack->Tiles.size()) + " tiles, " + std::to_string(pack->Objects.size()) + " objects)");
 	return pack;
 }
 
@@ -50,8 +51,8 @@ bool SnesHdPack::LoadDefinition(const string& definitionFile)
 {
 	string folder = FolderUtilities::GetFolderName(definitionFile);
 
-	vector<vector<uint32_t>> images;
-	vector<std::pair<uint32_t, uint32_t>> imageSizes;
+	LoadState state;
+	bool hasObject = false;
 
 	ifstream file(definitionFile);
 	string line;
@@ -68,6 +69,13 @@ bool SnesHdPack::LoadDefinition(const string& definitionFile)
 		string tag = line.substr(1, tagEnd - 1);
 		string value = line.substr(tagEnd + 1);
 
+		if(tag != "entry" && hasObject) {
+			if(!FinishObject(state)) {
+				return false;
+			}
+			hasObject = false;
+		}
+
 		if(tag == "scale") {
 			Scale = (uint32_t)std::stoi(value);
 			if(Scale < 1 || Scale > MaxScale) {
@@ -83,17 +91,40 @@ bool SnesHdPack::LoadDefinition(const string& definitionFile)
 			}
 			vector<uint32_t> pixels(width * height);
 			memcpy(pixels.data(), pngData.data(), pixels.size() * sizeof(uint32_t));
-			images.push_back(std::move(pixels));
-			imageSizes.push_back({ width, height });
-		} else if(tag == "tile") {
+			state.Images.push_back(std::move(pixels));
+			state.ImageSizes.push_back({ width, height });
+		} else if(tag == "tile" || tag == "variant") {
 			vector<string> tokens = StringUtilities::Split(value, ',');
-			if(!LoadTile(tokens, images, imageSizes)) {
+			if(!LoadTile(tokens, state, tag == "variant")) {
+				return false;
+			}
+		} else if(tag == "object") {
+			vector<string> tokens = StringUtilities::Split(value, ',');
+			if(!LoadObject(tokens, state)) {
+				return false;
+			}
+			hasObject = true;
+		} else if(tag == "entry") {
+			vector<string> tokens = StringUtilities::Split(value, ',');
+			if(!hasObject || !LoadEntry(tokens, state)) {
+				MessageManager::Log("[HDPack] Invalid or misplaced <entry> tag");
 				return false;
 			}
 		}
 	}
 
-	return !Tiles.empty();
+	if(hasObject && !FinishObject(state)) {
+		return false;
+	}
+
+	//Match the largest objects first, so a small one never takes an entry that belongs to a bigger one
+	for(auto& anchor : ObjectsByAnchor) {
+		std::stable_sort(anchor.second.begin(), anchor.second.end(), [this](uint16_t a, uint16_t b) {
+			return Objects[a].Entries.size() > Objects[b].Entries.size();
+		});
+	}
+
+	return !Tiles.empty() || !Objects.empty();
 }
 
 static vector<uint16_t> ParseWords(const string& hex)
@@ -106,10 +137,37 @@ static vector<uint16_t> ParseWords(const string& hex)
 	return words;
 }
 
-bool SnesHdPack::LoadTile(vector<string>& tokens, vector<vector<uint32_t>>& images, vector<std::pair<uint32_t, uint32_t>>& imageSizes)
+//Reads the 4 hex digits of each color as written by the recorder (most significant digit first)
+static vector<uint16_t> ParseColors(const string& hex)
+{
+	vector<uint16_t> colors(hex.size() / 4);
+	for(size_t i = 0; i < colors.size(); i++) {
+		colors[i] = (uint16_t)std::stoi(hex.substr(i * 4, 4), nullptr, 16);
+	}
+	return colors;
+}
+
+static void DecodeTile(const vector<uint16_t>& words, uint8_t bpp, uint8_t* index)
+{
+	for(int y = 0; y < 8; y++) {
+		for(int x = 0; x < 8; x++) {
+			int shift = 7 - x;
+			uint8_t color = 0;
+			for(int pair = 0; pair < bpp / 2; pair++) {
+				uint16_t word = words[pair * 8 + y];
+				color |= (((word & 0xFF) >> shift) & 1) << (pair * 2);
+				color |= (((word >> 8) >> shift) & 1) << (pair * 2 + 1);
+			}
+			index[y * 8 + x] = color;
+		}
+	}
+}
+
+bool SnesHdPack::LoadTile(vector<string>& tokens, LoadState& state, bool variant)
 {
 	size_t digits = tokens.size() >= 2 ? tokens[1].size() : 0;
-	if((tokens.size() != 4 && tokens.size() != 5) || (digits != 32 && digits != 64 && digits != 128)) {
+	bool validCount = variant ? tokens.size() == 5 : (tokens.size() == 4 || tokens.size() == 5);
+	if(!validCount || (digits != 32 && digits != 64 && digits != 128)) {
 		MessageManager::Log("[HDPack] Invalid tile tag (expected imageIndex,tileData(32, 64 or 128 hex digits),x,y[,palette])");
 		return false;
 	}
@@ -119,7 +177,7 @@ bool SnesHdPack::LoadTile(vector<string>& tokens, vector<vector<uint32_t>>& imag
 	uint32_t x = (uint32_t)std::stoi(tokens[2]);
 	uint32_t y = (uint32_t)std::stoi(tokens[3]);
 	uint32_t size = 8 * Scale;
-	if(imageIndex >= images.size() || x + size > imageSizes[imageIndex].first || y + size > imageSizes[imageIndex].second) {
+	if(imageIndex >= state.Images.size() || x + size > state.ImageSizes[imageIndex].first || y + size > state.ImageSizes[imageIndex].second) {
 		MessageManager::Log("[HDPack] Tile outside its image: " + tokens[1]);
 		return false;
 	}
@@ -133,34 +191,170 @@ bool SnesHdPack::LoadTile(vector<string>& tokens, vector<vector<uint32_t>>& imag
 	vector<uint16_t> tileWords = ParseWords(tokens[1]);
 	uint64_t tileHash = HashTile(tileWords.data(), 0, bpp);
 
-	bool hasPalette = tokens.size() == 5;
-	uint64_t paletteHash = 0;
-	if(hasPalette) {
+	vector<uint16_t> colors;
+	if(tokens.size() == 5) {
 		if(tokens[4].size() != 4 * ((1u << bpp) - 1)) {
 			MessageManager::Log("[HDPack] Invalid palette (expected " + std::to_string(4 * ((1u << bpp) - 1)) + " hex digits): " + tokens[4]);
 			return false;
 		}
-		//HashPalette skips color 0, so put a placeholder first
-		vector<uint16_t> colors = ParseWords(tokens[4]);
-		colors.insert(colors.begin(), 0);
-		paletteHash = HashPalette(colors.data(), 0, bpp);
+		colors = ParseColors(tokens[4]);
 	}
 
 	SnesHdTile tile;
 	tile.Pixels.resize(size * size);
-	uint32_t imageWidth = imageSizes[imageIndex].first;
+	uint32_t imageWidth = state.ImageSizes[imageIndex].first;
 	for(uint32_t row = 0; row < size; row++) {
-		memcpy(tile.Pixels.data() + row * size, images[imageIndex].data() + (y + row) * imageWidth + x, size * sizeof(uint32_t));
+		memcpy(tile.Pixels.data() + row * size, state.Images[imageIndex].data() + (y + row) * imageWidth + x, size * sizeof(uint32_t));
 	}
+
+	if(!variant && !colors.empty() && bpp <= 4) {
+		tile.HasReference = true;
+		DecodeTile(tileWords, bpp, tile.Index);
+		for(size_t i = 0; i < colors.size(); i++) {
+			tile.Reference[i + 1] = colors[i];
+		}
+	}
+
 	Tiles.push_back(std::move(tile));
 	uint16_t tileId = (uint16_t)Tiles.size();
 
 	TileEntry& entry = _entries[tileHash];
-	if(hasPalette) {
-		entry.Variants.push_back({ paletteHash, tileId });
+	if(variant) {
+		//HashPalette skips color 0, so put a placeholder first
+		colors.insert(colors.begin(), 0);
+		entry.Variants.push_back({ HashPalette(colors.data(), 0, bpp), tileId });
 	} else {
 		entry.DefaultId = tileId;
 	}
+	return true;
+}
+
+bool SnesHdPack::LoadObject(vector<string>& tokens, LoadState& state)
+{
+	if(tokens.size() != 11) {
+		MessageManager::Log("[HDPack] Invalid object tag (expected name,artImage,artX,artY,artW,artH,offsetX,offsetY,indexImage,indexX,indexY)");
+		return false;
+	}
+
+	SnesHdObject object;
+	object.Name = tokens[0];
+
+	uint32_t artImage = (uint32_t)std::stoi(tokens[1]);
+	uint32_t artX = (uint32_t)std::stoi(tokens[2]);
+	uint32_t artY = (uint32_t)std::stoi(tokens[3]);
+	object.ArtWidth = (uint32_t)std::stoi(tokens[4]);
+	object.ArtHeight = (uint32_t)std::stoi(tokens[5]);
+	object.OffsetX = std::stoi(tokens[6]);
+	object.OffsetY = std::stoi(tokens[7]);
+	state.IndexImage = (uint32_t)std::stoi(tokens[8]);
+	state.IndexX = (uint32_t)std::stoi(tokens[9]);
+	state.IndexY = (uint32_t)std::stoi(tokens[10]);
+
+	if(artImage >= state.Images.size() || state.IndexImage >= state.Images.size() ||
+		artX + object.ArtWidth > state.ImageSizes[artImage].first || artY + object.ArtHeight > state.ImageSizes[artImage].second) {
+		MessageManager::Log("[HDPack] Object art outside its image: " + object.Name);
+		return false;
+	}
+
+	object.Pixels.resize(object.ArtWidth * object.ArtHeight);
+	uint32_t imageWidth = state.ImageSizes[artImage].first;
+	for(uint32_t row = 0; row < object.ArtHeight; row++) {
+		memcpy(object.Pixels.data() + row * object.ArtWidth, state.Images[artImage].data() + (artY + row) * imageWidth + artX, object.ArtWidth * sizeof(uint32_t));
+	}
+
+	state.Current = std::move(object);
+	return true;
+}
+
+bool SnesHdPack::LoadEntry(vector<string>& tokens, LoadState& state)
+{
+	if(tokens.size() != 7 && tokens.size() != 8) {
+		return false;
+	}
+
+	SnesHdEntrySpec entry;
+	entry.X = (int16_t)std::stoi(tokens[0]);
+	entry.Y = (int16_t)std::stoi(tokens[1]);
+	entry.Width = (uint8_t)std::stoi(tokens[2]);
+	entry.Height = (uint8_t)std::stoi(tokens[3]);
+	entry.FlipH = std::stoi(tokens[4]) != 0;
+	entry.FlipV = std::stoi(tokens[5]) != 0;
+	entry.Signature = std::stoull(tokens[6], nullptr, 16);
+	if(tokens.size() == 8) {
+		if(tokens[7].size() != 60) {
+			return false;
+		}
+		entry.HasReference = true;
+		vector<uint16_t> colors = ParseColors(tokens[7]);
+		for(size_t i = 0; i < colors.size(); i++) {
+			entry.Reference[i + 1] = colors[i];
+		}
+	}
+
+	if(state.Current.Entries.size() >= SnesHdObject::MaxEntries || entry.X < 0 || entry.Y < 0) {
+		return false;
+	}
+	state.Current.Entries.push_back(entry);
+	return true;
+}
+
+bool SnesHdPack::FinishObject(LoadState& state)
+{
+	SnesHdObject& object = state.Current;
+	if(object.Entries.empty()) {
+		MessageManager::Log("[HDPack] Object without entries: " + object.Name);
+		return false;
+	}
+
+	for(SnesHdEntrySpec& entry : object.Entries) {
+		object.Width = std::max<uint16_t>(object.Width, entry.X + entry.Width);
+		object.Height = std::max<uint16_t>(object.Height, entry.Y + entry.Height);
+	}
+
+	uint32_t imageWidth = state.ImageSizes[state.IndexImage].first;
+	if(state.IndexX + object.Width > imageWidth || state.IndexY + object.Height > state.ImageSizes[state.IndexImage].second) {
+		MessageManager::Log("[HDPack] Object index map outside its image: " + object.Name);
+		return false;
+	}
+
+	//Read the index map: R = entry, G = color index. Pixels the original didn't draw take the nearest one that it did
+	uint32_t width = object.Width;
+	uint32_t height = object.Height;
+	object.Source.assign(width * height, 0);
+	std::deque<uint32_t> queue;
+	for(uint32_t y = 0; y < height; y++) {
+		for(uint32_t x = 0; x < width; x++) {
+			uint32_t pixel = state.Images[state.IndexImage][(state.IndexY + y) * imageWidth + state.IndexX + x];
+			uint16_t source = (uint16_t)((((pixel >> 16) & 0xFF) << 8) | ((pixel >> 8) & 0xFF));
+			if((source & 0xFF) != 0) {
+				object.Source[y * width + x] = source;
+				queue.push_back(y * width + x);
+			}
+		}
+	}
+	while(!queue.empty()) {
+		uint32_t index = queue.front();
+		queue.pop_front();
+		uint32_t x = index % width;
+		uint32_t y = index / width;
+		const int neighbours[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+		for(auto& n : neighbours) {
+			int nx = (int)x + n[0];
+			int ny = (int)y + n[1];
+			if(nx >= 0 && ny >= 0 && nx < (int)width && ny < (int)height && object.Source[ny * width + nx] == 0) {
+				object.Source[ny * width + nx] = object.Source[index];
+				queue.push_back(ny * width + nx);
+			}
+		}
+	}
+
+	if(Objects.size() >= 0xFFFF) {
+		MessageManager::Log("[HDPack] Too many objects");
+		return false;
+	}
+	ObjectsByAnchor[object.Entries[0].Signature].push_back((uint16_t)Objects.size());
+	Objects.push_back(std::move(object));
+	state.Current = SnesHdObject();
 	return true;
 }
 
