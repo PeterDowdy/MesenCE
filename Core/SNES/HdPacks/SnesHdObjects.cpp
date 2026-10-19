@@ -110,6 +110,7 @@ unique_ptr<SnesHdObjectRecorder> SnesHdObjectRecorder::Create(bool nes)
 
 	unique_ptr<SnesHdObjectRecorder> recorder(new SnesHdObjectRecorder());
 	recorder->_folder = folder;
+	recorder->_splitByPalette = nes; //A NES sprite palette is one character's (or one kind of enemy's): sprites of another palette that touch it are not part of it
 	std::filesystem::create_directories(std::filesystem::path(folder) / "png");
 	return recorder;
 }
@@ -182,8 +183,16 @@ void SnesHdObjectRecorder::Record(uint32_t frame, const vector<SnesHdOamEntry>& 
 
 	//Group entries that touch on screen. A group that's too big to be one object is split into runs of entries that are
 	//next to each other in OAM
-	auto touches = [](const SnesHdOamEntry& a, const SnesHdOamEntry& b) {
-		return a.X < b.X + b.Width + 1 && b.X < a.X + a.Width + 1 && a.Y < b.Y + b.Height + 1 && b.Y < a.Y + a.Height + 1;
+	//NES: the parts of one sprite are tiles of one sheet (near each other in CHR) and a part isn't a second copy of another
+	//(two stars next to each other are two stars, two flipped halves of a body are one body)
+	auto nesSameObject = [](const SnesHdOamEntry& a, const SnesHdOamEntry& b) {
+		bool near = std::abs((int)a.Cells[0] - (int)b.Cells[0]) <= 64;
+		bool copy = a.Signature == b.Signature && a.FlipH == b.FlipH && a.FlipV == b.FlipV;
+		return near && !copy;
+	};
+	bool splitByPalette = _splitByPalette;
+	auto touches = [splitByPalette, nesSameObject](const SnesHdOamEntry& a, const SnesHdOamEntry& b) {
+		return a.X < b.X + b.Width + 1 && b.X < a.X + a.Width + 1 && a.Y < b.Y + b.Height + 1 && b.Y < a.Y + a.Height + 1 && (!splitByPalette || a.Palette == b.Palette) && !a.Particle && !b.Particle && (!splitByPalette || nesSameObject(a, b));
 	};
 
 	vector<int> parent(entries.size());

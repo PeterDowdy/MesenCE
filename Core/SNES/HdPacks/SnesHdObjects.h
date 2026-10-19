@@ -17,6 +17,7 @@ struct SnesHdOamEntry
 	bool FlipH = false;
 	bool FlipV = false;
 	uint64_t Signature = 0; //Hash of the CHR data of its tiles, in the order they're stored (not flipped)
+	bool Particle = false; //A speck of a sprite (a few pixels: a sparkle, dust): the recorder never groups it with others
 	uint8_t CellCount = 0;
 	uint16_t Cells[64] = {}; //Word address in VRAM of each tile, row by row, as stored
 };
@@ -39,7 +40,7 @@ public:
 //  png/<id>.png the object at the original resolution, in the palette it was first seen with
 //  png/<id>_idx.png  R = the entry that drew each pixel, G = its color index (0 = none)
 //  frames.txt   "F <frame> <id> <x> <y> <orientation> <palette> <oam index>" for every object on screen in every frame
-//Objects are groups of OAM entries that are next to each other in OAM and on screen. An object that is drawn mirrored
+//Objects are groups of OAM entries that are next to each other in OAM and on screen (on the NES, of one sprite palette). An object that is drawn mirrored
 //is the same object: the files hold it in whichever orientation sorts first.
 //How the recorder reads an entry's pixels and palette, which differ by console
 struct SnesHdRecordSource
@@ -67,6 +68,7 @@ private:
 	};
 
 	string _folder;
+	bool _splitByPalette = false;
 	int _colorsPerPalette = 15;
 	int _digitsPerColor = 4;
 	std::map<string, ObjectRecord> _records;

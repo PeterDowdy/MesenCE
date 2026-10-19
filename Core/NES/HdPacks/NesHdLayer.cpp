@@ -189,6 +189,19 @@ void NesHdLayer::BuildEntries(const HdScreenInfo& info, vector<SnesHdOamEntry>& 
 		entry.FlipV = (attributes & 0x80) != 0;
 		entry.Signature = signature;
 		entry.CellCount = height / 8;
+
+		//A few pixels in all: a sparkle or a puff of dust, which is drawn next to anything and is not part of it
+		int opaque = 0;
+		for(int32_t tile : { t0, t1 }) {
+			if(tile >= 0 && (tile == t0 || height == 16)) {
+				uint8_t chr[16];
+				ReadChr(tile, chr);
+				for(int row = 0; row < 8; row++) {
+					opaque += __builtin_popcount((uint8_t)(chr[row] | chr[row + 8]));
+				}
+			}
+		}
+		entry.Particle = opaque <= 8;
 		entry.Cells[0] = (uint16_t)t0;
 		entry.Cells[1] = (uint16_t)t1;
 		entries.push_back(entry);
